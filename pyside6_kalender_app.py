@@ -1,17 +1,38 @@
 ﻿import calendar
 import hashlib
+import importlib
 import json
+import math
 import os
+import re
 import shutil
+import signal
+import subprocess
 import sys
+import time
+import tempfile
 import ctypes
 import urllib.request
 import urllib.error
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from typing import Protocol
 
-import holidays
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except Exception:
+    tk = None
+    ttk = None
+
+_MISSING_REQUIRED_DEPS: list[str] = []
+
+try:
+    import holidays
+except Exception:
+    holidays = None
+    _MISSING_REQUIRED_DEPS.append("holidays")
 try:
     import psutil
 except Exception:
@@ -20,47 +41,490 @@ try:
     import pygetwindow as gw
 except Exception:
     gw = None
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import PatternFill
-from PySide6.QtCore import Qt, Signal, QEvent, QPoint, QObject, QTimer, QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup
-from PySide6.QtGui import QAction, QColor, QFont, QBrush, QLinearGradient, QGradient, QPen, QPixmap, QPainter, QIcon
-from PySide6.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QDialog,
-    QFormLayout,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QColorDialog,
-    QScrollArea,
-    QSystemTrayIcon,
-    QMenu,
-    QStatusBar,
-    QStyledItemDelegate,
-    QSizePolicy,
-    QTabBar,
-    QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
-    QTextEdit,
-    QFrame,
-    QHeaderView,
-    QToolBar,
-    QVBoxLayout,
-    QWidget,
-    QSpinBox,
-    QCheckBox,
-    QAbstractItemView,
-)
+try:
+    from pycaw.pycaw import AudioUtilities
+except Exception:
+    AudioUtilities = None
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import PatternFill
+except Exception:
+    Workbook = None
+    load_workbook = None
+    PatternFill = None
+    _MISSING_REQUIRED_DEPS.append("openpyxl")
+try:
+    from PySide6.QtCore import Qt, Signal, QEvent, QPoint, QObject, QTimer, QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup, Property, QLockFile, QAbstractNativeEventFilter, QDate
+    from PySide6.QtGui import QAction, QColor, QFont, QBrush, QLinearGradient, QGradient, QPen, QPixmap, QPainter, QIcon, QPolygon
+    from PySide6.QtWidgets import (
+        QApplication,
+        QComboBox,
+        QDialog,
+        QFormLayout,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QPushButton,
+        QColorDialog,
+        QScrollArea,
+        QSystemTrayIcon,
+        QMenu,
+        QStatusBar,
+        QStyledItemDelegate,
+        QSizePolicy,
+        QTabBar,
+        QTabWidget,
+        QTableWidget,
+        QTableWidgetItem,
+        QTextEdit,
+        QDateEdit,
+        QFrame,
+        QHeaderView,
+        QToolBar,
+        QVBoxLayout,
+        QWidget,
+        QSpinBox,
+        QSlider,
+        QCheckBox,
+        QAbstractItemView,
+        QStyle,
+    )
+except Exception:
+    _MISSING_REQUIRED_DEPS.append("PySide6")
 
+
+# ============================================================================
+# MODULE OVERVIEW
+# Dit bestand bevat de volledige applicatie in één script: opslag, dialogs,
+# kalender, dashboard en timer-overlay. De code is bewust in secties opgebouwd
+# zodat je top-down kunt analyseren: eerst helpers, dan opslag, daarna UI shells.
+# ============================================================================
+
+
+def detect_imports(script_path: str) -> list[str]:
+    """Detecteert externe imports in een script (top-level package names)."""
+    imports = set()
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                match_import = re.match(r"import\s+([A-Za-z0-9_\.]+)", line)
+                match_from = re.match(r"from\s+([A-Za-z0-9_\.]+)\s+import", line)
+                if match_import:
+                    imports.add(match_import.group(1).split(".")[0])
+                elif match_from:
+                    imports.add(match_from.group(1).split(".")[0])
+    except Exception:
+        return []
+    stdlib = set(getattr(sys, "stdlib_module_names", set()))
+    return sorted(m for m in imports if m and m not in stdlib and m not in {"tkinter"})
+
+
+BOOTSTRAP_CHECKS: list[tuple[str, str, str]] = [
+    ("PySide6", "PySide6", "UI framework"),
+    ("openpyxl", "openpyxl", "Excel engine"),
+    ("holidays", "holidays", "Feestdagen"),
+    ("psutil", "psutil", "Procesdetectie"),
+    ("pygetwindow", "pygetwindow", "Window detectie"),
+    ("pycaw", "pycaw", "Audio sessie detectie"),
+]
+OPTIONAL_BOOTSTRAP_IMPORTS = {"pycaw"}
+
+
+def run_bootstrap(
+    checks: list[tuple[str, str, str]],
+    dry_run: bool = False,
+    simulate_missing: bool = False,
+    wait_for_close: bool = False,
+) -> bool:
+    """Checkt alle dependencies en installeert ontbrekende packages met splash/progress."""
+    checks = [(imp, pip_pkg, label) for imp, pip_pkg, label in checks if imp and pip_pkg]
+    if not checks:
+        return True
+    check_rows = [("__python__", "", "Python runtime")] + checks
+    close_btn = None
+    optional_install_failed: list[str] = []
+
+    def _is_optional(import_name: str) -> bool:
+        return import_name in OPTIONAL_BOOTSTRAP_IMPORTS
+
+    def _bootstrap_failure_hint(import_name: str, pip_pkg: str, recent_output: list[str]) -> str:
+        txt = " ".join((recent_output or [])).lower()
+        if "no matching distribution found" in txt or "could not find a version that satisfies" in txt:
+            return "Tip: update pip en controleer je Python-versie (bijv. 'python -m pip install --upgrade pip')."
+        if "ssl" in txt or "certificate_verify_failed" in txt or "proxy" in txt:
+            return "Tip: netwerk/proxy/certificaat blokkeert pip. Probeer via bedrijfs-VPN of configureer pip-proxy."
+        if "access is denied" in txt or "permission denied" in txt:
+            return "Tip: onvoldoende rechten. Sluit andere Python-processen en probeer opnieuw."
+        if "microsoft visual c++" in txt or "error: microsoft visual c++" in txt:
+            return "Tip: installeer Microsoft C++ Build Tools of gebruik een wheel-compatibele Python-versie."
+        if import_name == "pycaw" or pip_pkg == "pycaw":
+            return "Tip: pycaw is optioneel; app werkt door zonder audio-sessiedetectie."
+        return "Tip: controleer de pip-log hierboven en probeer handmatig: python -m pip install <pakket> --user"
+
+    def _ensure_pip_available(log_fn=None) -> bool:
+        def _log(msg: str, color: str = "#dce4f0"):
+            if callable(log_fn):
+                try:
+                    log_fn(msg, color)
+                except Exception:
+                    pass
+
+        try:
+            rc = subprocess.call([sys.executable, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if rc == 0:
+                return True
+        except Exception:
+            pass
+
+        _log("[~] pip niet gevonden, probeer ensurepip...", "#f3b37a")
+        try:
+            rc = subprocess.call([sys.executable, "-m", "ensurepip", "--upgrade"])
+            if rc != 0:
+                _log("[X] ensurepip mislukt", "#ff9492")
+                return False
+        except Exception:
+            _log("[X] ensurepip niet beschikbaar", "#ff9492")
+            return False
+
+        try:
+            rc = subprocess.call([sys.executable, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if rc == 0:
+                _log("[V] pip hersteld via ensurepip", "#7ad18b")
+                return True
+        except Exception:
+            pass
+        _log("[X] pip nog steeds niet beschikbaar", "#ff9492")
+        return False
+
+    if tk is None or ttk is None:
+        py_ok = bool(sys.executable) and os.path.exists(sys.executable)
+        if not py_ok:
+            return False
+        if not dry_run and not _ensure_pip_available():
+            return False
+        for import_name, pip_pkg, _label in checks:
+            try:
+                if simulate_missing:
+                    raise ImportError("simulated missing")
+                importlib.import_module(import_name)
+                continue
+            except Exception:
+                pass
+            if dry_run:
+                continue
+            rc = subprocess.call([sys.executable, "-m", "pip", "install", pip_pkg, "--user"])
+            if rc != 0:
+                if _is_optional(import_name):
+                    continue
+                return False
+        return True
+
+    root = tk.Tk()
+    root.overrideredirect(not wait_for_close)
+    root.geometry("760x560+500+220")
+    root.configure(bg="#1c212b")
+
+    frame = tk.Frame(root, bg="#1c212b", padx=12, pady=10)
+    frame.pack(expand=True, fill="both")
+    tk.Label(frame, text="Tijdplanner Bootstrapper", bg="#1c212b", fg="#e6edf7", font=("Segoe UI Semibold", 16)).pack(pady=(2, 2))
+    tk.Label(
+        frame,
+        text="Controle op Python + vereiste imports. Ontbrekende modules worden automatisch geinstalleerd.",
+        bg="#1c212b",
+        fg="#9fb0c5",
+        font=("Segoe UI", 10),
+    ).pack(pady=(0, 6))
+
+    status_label = tk.Label(frame, text="Start controles...", bg="#1c212b", fg="#dce4f0", font=("Segoe UI", 10))
+    status_label.pack(pady=(0, 6))
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure(
+        "TP.Horizontal.TProgressbar",
+        troughcolor="#222b38",
+        background="#355071",
+        bordercolor="#3b4759",
+        lightcolor="#4e7fba",
+        darkcolor="#2f4f75",
+    )
+    progress = ttk.Progressbar(frame, style="TP.Horizontal.TProgressbar", mode="determinate", length=720, maximum=100)
+    progress.pack(pady=5)
+
+    check_frame = tk.Frame(frame, bg="#263141", highlightbackground="#3b4759", highlightthickness=1, bd=0)
+    check_frame.pack(fill="x", pady=(8, 8))
+    tk.Label(check_frame, text="Checklist", bg="#263141", fg="#dce4f0", font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=8, pady=(6, 2))
+
+    check_labels: dict[str, tk.Label] = {}
+    for import_name, _pip_pkg, label in check_rows:
+        if import_name == "__python__":
+            line_txt = "Python runtime (executable + versie)"
+        else:
+            line_txt = f"{import_name} ({label})"
+        lbl = tk.Label(
+            check_frame,
+            text=f"[ ] {line_txt}",
+            anchor="w",
+            bg="#263141",
+            fg="#9fb0c5",
+            font=("Consolas", 10),
+            padx=8,
+        )
+        lbl.pack(fill="x", pady=1)
+        check_labels[import_name] = lbl
+
+    list_frame = tk.Frame(frame, bg="#1c212b")
+    list_frame.pack(expand=True, fill="both", pady=(0, 8))
+    scrollbar = tk.Scrollbar(list_frame, bg="#222b38", troughcolor="#1a2230", activebackground="#355071")
+    scrollbar.pack(side="right", fill="y")
+    listbox = tk.Listbox(
+        list_frame,
+        font=("Consolas", 10),
+        yscrollcommand=scrollbar.set,
+        bg="#1f2835",
+        fg="#dce4f0",
+        selectbackground="#355071",
+        selectforeground="#ffffff",
+        borderwidth=1,
+        highlightthickness=1,
+        highlightbackground="#3b4759",
+    )
+    listbox.pack(expand=True, fill="both")
+    scrollbar.config(command=listbox.yview)
+    root.update()
+
+    def show_manual_close():
+        nonlocal close_btn
+        if close_btn is not None:
+            return
+        close_btn = tk.Button(
+            frame,
+            text="Sluiten",
+            bg="#355071",
+            fg="#ffffff",
+            activebackground="#4e7fba",
+            activeforeground="#ffffff",
+            relief="flat",
+            padx=14,
+            pady=6,
+            command=root.destroy,
+        )
+        close_btn.pack(pady=(0, 4))
+
+    def hold_on_error(status_text: str) -> bool:
+        status_label.config(text=status_text, fg="#ff9492")
+        progress["value"] = 100
+        root.update()
+        show_manual_close()
+        root.mainloop()
+        return False
+
+    def set_check_state(key: str, state: str, suffix: str = ""):
+        lbl = check_labels.get(key)
+        if not lbl:
+            return
+        if state == "running":
+            prefix = "[~]"
+            color = "#9ecbff"
+        elif state == "ok":
+            prefix = "[V]"
+            color = "#7ad18b"
+        elif state == "fail":
+            prefix = "[X]"
+            color = "#ff9492"
+        else:
+            prefix = "[ ]"
+            color = "#9fb0c5"
+        text = lbl.cget("text")
+        base = text[text.find("]") + 2 :] if "]" in text else text
+        if suffix:
+            base = f"{base.split(' - ')[0]} - {suffix}"
+        lbl.config(text=f"{prefix} {base}", fg=color)
+
+    def log_line(text: str, color: str = "#dce4f0"):
+        listbox.insert(tk.END, text)
+        listbox.itemconfig(tk.END, foreground=color)
+        listbox.yview_moveto(1.0)
+        root.update()
+
+    total = max(1, len(check_rows))
+    done = 0
+
+    set_check_state("__python__", "running")
+    status_label.config(text="Check: Python runtime")
+    root.update()
+    py_ok = bool(sys.executable) and os.path.exists(sys.executable)
+    if py_ok:
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        set_check_state("__python__", "ok", f"Python {py_ver}")
+        log_line(f"[V] Python runtime aanwezig ({py_ver})", "#7ad18b")
+    else:
+        set_check_state("__python__", "fail", "niet gevonden")
+        log_line("[X] Python runtime ontbreekt", "#ff9492")
+        return hold_on_error("Fout: Python niet gevonden")
+    done += 1
+    progress["value"] = (done / total) * 100
+    root.update()
+
+    if not dry_run:
+        status_label.config(text="Check: pip")
+        root.update()
+        if not _ensure_pip_available(log_line):
+            log_line("[!] Tip: controleer of Python volledig is geinstalleerd en of ensurepip beschikbaar is.", "#f3b37a")
+            return hold_on_error("Fout: pip niet beschikbaar")
+
+    for i, (import_name, pip_pkg, label) in enumerate(checks, start=1):
+        set_check_state(import_name, "running")
+        status_label.config(text=f"Check: {import_name} ({label})")
+        root.update()
+        try:
+            if simulate_missing:
+                raise ImportError("simulated missing")
+            importlib.import_module(import_name)
+            set_check_state(import_name, "ok", "aanwezig")
+            log_line(f"[V] {import_name} aanwezig", "#7ad18b")
+            time.sleep(0.04)
+            done += 1
+            progress["value"] = (done / total) * 100
+            root.update()
+            continue
+        except Exception:
+            set_check_state(import_name, "fail", "ontbreekt")
+            log_line(f"[X] {import_name} ontbreekt -> installeren ({pip_pkg})", "#ff9492")
+            root.update()
+
+        if dry_run:
+            time.sleep(0.1)
+            set_check_state(import_name, "ok", "dry-run")
+            done += 1
+            progress["value"] = (done / total) * 100
+            log_line(f"[V] {import_name} dry-run install (gesimuleerd)", "#7ad18b")
+            root.update()
+            continue
+
+        process = subprocess.Popen(
+            [sys.executable, "-m", "pip", "install", pip_pkg, "--user"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        pip_recent_lines: list[str] = []
+        while True:
+            line = process.stdout.readline() if process.stdout else ""
+            if line == "" and process.poll() is not None:
+                break
+            if line:
+                clean = line.strip()
+                if clean:
+                    pip_recent_lines.append(clean)
+                    if len(pip_recent_lines) > 18:
+                        pip_recent_lines.pop(0)
+                log_line(clean[:140], "#f3b37a")
+        if process.returncode != 0:
+            hint = _bootstrap_failure_hint(import_name, pip_pkg, pip_recent_lines)
+            if _is_optional(import_name):
+                set_check_state(import_name, "fail", "optioneel: installatie fout")
+                optional_install_failed.append(import_name)
+                log_line(
+                    f"[!] {import_name} kon niet worden geinstalleerd; app start zonder deze optionele detectie.",
+                    "#f3b37a",
+                )
+                log_line(f"[!] {hint}", "#f3b37a")
+                done += 1
+                progress["value"] = (done / total) * 100
+                root.update()
+                continue
+            set_check_state(import_name, "fail", "installatie fout")
+            log_line(f"[X] Installatie van {import_name} is mislukt. Bekijk de logregels hierboven.", "#ff9492")
+            log_line(f"[!] {hint}", "#f3b37a")
+            return hold_on_error(f"Fout bij {import_name}")
+        set_check_state(import_name, "ok", "geinstalleerd")
+        done += 1
+        progress["value"] = (done / total) * 100
+        log_line(f"[V] {import_name} geinstalleerd", "#7ad18b")
+        root.update()
+        time.sleep(0.08)
+
+    if optional_install_failed:
+        status_label.config(
+            text=f"Gereed met waarschuwing: optioneel mislukt ({', '.join(optional_install_failed)})",
+            fg="#f3b37a",
+        )
+    else:
+        status_label.config(text="Alle modules klaar")
+    progress["value"] = 100
+    root.update()
+    if wait_for_close:
+        show_manual_close()
+        status_label.config(text="Preview klaar - sluit het venster handmatig")
+        root.update()
+        root.mainloop()
+    else:
+        time.sleep(0.3)
+        root.destroy()
+    return True
+
+
+def _bootstrap_and_restart_if_needed():
+    # We doen de dependency-check vroeg in de opstartflow zodat alle imports die later gebruikt worden
+    # daadwerkelijk beschikbaar zijn. Als we hier pas halverwege de app zouden falen, krijg je
+    # lastige runtime-errors op willekeurige plekken in plaats van een gecontroleerde startup-fout.
+    checks = list(BOOTSTRAP_CHECKS)
+    if "--bootstrap-demo" in sys.argv:
+        ok = run_bootstrap(checks, dry_run=True)
+        if not ok:
+            raise SystemExit(1)
+        raise SystemExit(0)
+    if "--bootstrap-preview" in sys.argv:
+        ok = run_bootstrap(checks, dry_run=True, simulate_missing=True, wait_for_close=True)
+        if not ok:
+            raise SystemExit(1)
+        raise SystemExit(0)
+    missing = []
+    for import_name, _pip_pkg, _label in checks:
+        try:
+            importlib.import_module(import_name)
+        except Exception:
+            if import_name in OPTIONAL_BOOTSTRAP_IMPORTS:
+                continue
+            missing.append(import_name)
+    if not missing:
+        return
+    if os.environ.get("TP_BOOTSTRAP_DONE") == "1":
+        print("Ontbrekende modules na bootstrap:", ", ".join(missing))
+        raise SystemExit(1)
+    ok = run_bootstrap(checks, dry_run=False)
+    if not ok:
+        print("Bootstrap mislukt. Installeer handmatig:", ", ".join(missing))
+        raise SystemExit(1)
+    # Na succesvolle install herstarten we het proces expres hard met hetzelfde script + args.
+    # Zo laden we direct de nieuw geïnstalleerde modules in een schone interpreter-state.
+    os.environ["TP_BOOTSTRAP_DONE"] = "1"
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+_bootstrap_and_restart_if_needed()
+
+
+# ============================================================================
+# BASISCONSTANTEN EN PURE HELPERS
+# In dit deel staan parse/format helpers en vaste waarden die op meerdere
+# plekken gebruikt worden. Door dit centraal te houden voorkom je afwijkende
+# interpretaties van tijd, data en labels tussen schermen.
+# ============================================================================
 
 WEEKDAYS = ["MA", "DI", "WO", "DO", "VR", "ZA", "ZO"]
+WEEKDAY_NAMES_NL = ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"]
 MONTHS_NL = [
     "Januari",
     "Februari",
@@ -80,13 +544,15 @@ DEFAULT_EXTRA_INFO_OPTIONS = [
     "cursus",
     "bijzonder verlof",
     "zwangerschap",
+    "ziekte",
+    "tijd voor tijd",
 ]
 
 COLOR_DEFAULTS = {
     "bg_today_dark": "#1f2a3a",
-    "bg_vacation_dark": "#3b2e1a",
-    "bg_holiday_dark": "#173D37",
-    "bg_school_dark": "#1d4ed8",
+    "bg_vacation_dark": "#7a6a44",
+    "bg_holiday_dark": "#630000",
+    "bg_school_dark": "#4F78A7",
     "bg_weekend_dark": "#232a34",
     "bg_default_dark": "#161b22",
     "daynum_today_dark": "#79c0ff",
@@ -108,8 +574,120 @@ COLOR_DEFAULTS = {
     "timer_btn_dark": "#355071",
 }
 
+PLANNED_COLOR_DEFAULTS = dict(COLOR_DEFAULTS)
+WORKED_COLOR_DEFAULTS = dict(PLANNED_COLOR_DEFAULTS)
+
 GLASS_OPACITY_MIN = 0.15
 GLASS_OPACITY_MAX = 0.95
+
+APP_VERSION = "1.7.4"
+APP_AUTHOR = "Rvwan"
+APP_LAST_UPDATE = "2026-02-24"
+_APP_INSTANCE_LOCK = None
+
+
+def set_windows_app_user_model_id(app_id: str = "Rvwan.TijdplannerPro") -> None:
+    """Zet expliciet AppUserModelID zodat taskbar-icoon correct wordt getoond op Windows."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id))
+    except Exception:
+        pass
+
+
+def acquire_single_instance_lock() -> bool:
+    """Forceer 1 actieve instantie van de app."""
+    global _APP_INSTANCE_LOCK
+    lock_path = os.path.join(tempfile.gettempdir(), "tijdplanner_pro.instance.lock")
+    lock = QLockFile(lock_path)
+    lock.setStaleLockTime(120 * 1000)
+    if not lock.tryLock(0):
+        return False
+    _APP_INSTANCE_LOCK = lock
+    return True
+
+
+def _terminate_process_by_pid(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return False
+    try:
+        if sys.platform == "win32":
+            os.kill(int(pid), signal.SIGTERM)
+        else:
+            os.kill(int(pid), signal.SIGTERM)
+        return True
+    except Exception:
+        return False
+
+
+def try_takeover_existing_instance() -> bool:
+    """Probeer bestaande lockhouder te sluiten en lock over te nemen."""
+    lock_path = os.path.join(tempfile.gettempdir(), "tijdplanner_pro.instance.lock")
+    lock = QLockFile(lock_path)
+    lock.setStaleLockTime(120 * 1000)
+    pid, _host, _app = lock.getLockInfo()
+    if not _terminate_process_by_pid(int(pid or 0)):
+        return False
+    for _ in range(25):
+        if lock.tryLock(100):
+            global _APP_INSTANCE_LOCK
+            _APP_INSTANCE_LOCK = lock
+            return True
+        time.sleep(0.06)
+    return False
+
+
+def build_status_icon(running: bool = True, work_seconds: int = 0, idle_seconds: int = 0) -> QIcon:
+    """Genereert één consistente app-/tray-icoonstijl."""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    grad = QLinearGradient(0, 0, 64, 64)
+    if running:
+        grad.setColorAt(0.0, QColor("#1ea672"))
+        grad.setColorAt(1.0, QColor("#2563eb"))
+    else:
+        grad.setColorAt(0.0, QColor("#6b7280"))
+        grad.setColorAt(1.0, QColor("#374151"))
+    p.setBrush(grad)
+    p.setPen(QPen(QColor("#dff7ff"), 2))
+    p.drawRoundedRect(6, 6, 52, 52, 14, 14)
+
+    p.setBrush(Qt.NoBrush)
+    ring_color = QColor("#facc15") if idle_seconds > 0 and running else QColor("#ecfeff")
+    p.setPen(QPen(ring_color, 3))
+    p.drawEllipse(12, 12, 40, 40)
+
+    sec = int(work_seconds) % 60
+    arc_span = int((sec / 60.0) * 360 * 16)
+    p.setPen(QPen(QColor("#ffffff"), 3))
+    p.drawArc(12, 12, 40, 40, 90 * 16, -arc_span)
+
+    mins = max(0, int(work_seconds) // 60)
+    if mins < 60:
+        txt = f"{mins:02d}"
+    else:
+        hours = mins // 60
+        txt = f"{hours}h" if hours < 100 else "99h+"
+    p.setPen(QPen(QColor("#f8fafc"), 1))
+    p.setFont(QFont("Segoe UI", 12 if mins >= 60 else 14, QFont.Bold))
+    p.drawText(pm.rect(), Qt.AlignCenter, txt)
+
+    p.setBrush(QColor("#f8fafc"))
+    p.setPen(QPen(QColor("#f8fafc"), 1))
+    if running:
+        tri = QPolygon([QPoint(45, 50), QPoint(45, 58), QPoint(52, 54)])
+        p.drawPolygon(tri)
+    else:
+        p.drawRect(45, 50, 2, 8)
+        p.drawRect(50, 50, 2, 8)
+    p.end()
+    return QIcon(pm)
 
 
 def normalize_hhmm(value: str | None, default: str = "00:00") -> str:
@@ -172,6 +750,46 @@ def seconds_to_hhmmss(seconds: int) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 
+def parse_duration_hhmm(value: str | None, default: int = 0, allow_signed: bool = False) -> int:
+    if value is None:
+        return int(default)
+    s = str(value).strip().replace(".", ":")
+    if not s:
+        return int(default)
+    sign = 1
+    if allow_signed and s[0] in "+-":
+        if s[0] == "-":
+            sign = -1
+        s = s[1:].strip()
+    if ":" not in s:
+        if s.isdigit():
+            return sign * (int(s) * 60)
+        return int(default)
+    h_txt, m_txt = s.split(":", 1)
+    if not (h_txt.isdigit() and m_txt.isdigit()):
+        return int(default)
+    mins = int(m_txt)
+    if mins < 0 or mins > 59:
+        return int(default)
+    return sign * (int(h_txt) * 60 + mins)
+
+
+def format_duration_hhmm(minutes: int, signed: bool = False) -> str:
+    m = int(minutes or 0)
+    sign = ""
+    if signed and m < 0:
+        sign = "-"
+    m_abs = abs(m)
+    return f"{sign}{m_abs // 60}:{m_abs % 60:02d}"
+
+
+def format_hours_int(minutes: int, signed: bool = False) -> str:
+    hrs = int(round((minutes or 0) / 60.0))
+    if signed:
+        return f"{hrs:+d}"
+    return str(hrs)
+
+
 def hhmmss_to_seconds(value) -> int:
     if value is None:
         return 0
@@ -214,12 +832,114 @@ def daterange(start_date: date, end_date: date):
         yield start_date + timedelta(n)
 
 
+def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
+    """Sla workbook atomisch op om corruptie bij mislukte write te beperken.
+
+    Eerst wordt een tijdelijk bestand geschreven in dezelfde map en daarna pas
+    het doelbestand vervangen. Dat voorkomt dat een halve write het originele
+    bestand direct beschadigt.
+    """
+    tmp_path = f"{path}.tmp"
+    bak_path = f"{path}.bak"
+    # Rotating snapshots beperken schade bij late detectie van bestandscorruptie.
+    # We schrijven deze snapshots bewust beperkt in frequentie om save-latency laag te houden.
+    snapshots_dir = os.path.join(os.path.dirname(path), "_backups")
+    snapshot_keep = 12
+    snapshot_interval_sec = 30 * 60  # 30 min
+    if not hasattr(save_workbook_atomic, "_last_snapshot_ts"):
+        save_workbook_atomic._last_snapshot_ts = {}
+
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        workbook.save(tmp_path)
+        if keep_backup and os.path.exists(path):
+            try:
+                shutil.copy2(path, bak_path)
+            except Exception:
+                pass
+            try:
+                now_ts = time.time()
+                key = os.path.abspath(path).casefold()
+                last_ts = float(save_workbook_atomic._last_snapshot_ts.get(key, 0.0))
+                if (now_ts - last_ts) >= snapshot_interval_sec:
+                    os.makedirs(snapshots_dir, exist_ok=True)
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    base = os.path.splitext(os.path.basename(path))[0]
+                    snap_path = os.path.join(snapshots_dir, f"{base}_{stamp}.xlsx")
+                    shutil.copy2(path, snap_path)
+                    save_workbook_atomic._last_snapshot_ts[key] = now_ts
+                    snaps = sorted(
+                        [p for p in os.listdir(snapshots_dir) if p.lower().startswith(base.lower() + "_") and p.lower().endswith(".xlsx")]
+                    )
+                    while len(snaps) > snapshot_keep:
+                        old = snaps.pop(0)
+                        try:
+                            os.remove(os.path.join(snapshots_dir, old))
+                        except Exception:
+                            break
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
+    except PermissionError as exc:
+        raise RuntimeError(
+            "Opslaan mislukt: het Excel-bestand lijkt in gebruik. Sluit het bestand en probeer opnieuw."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Opslaan mislukt door bestandsfout: {exc}") from exc
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 @dataclass
 class DayData:
     w: str = "00:00"
     v: str = "00:00"
     z: str = "00:00"
     worked: str = ""
+
+
+class StorageBackend(Protocol):
+    """Kleine contractlaag tussen UI en opslagimplementatie.
+
+    Nu is ExcelStore de concrete backend. Later kan een andere backend deze
+    interface implementeren zonder de UI-code fundamenteel te herschrijven.
+    """
+
+    year: int
+    wb: object
+    path: str
+
+    def safe_save(self) -> None:
+        ...
+
+    def get_day(self, dt: date) -> DayData:
+        ...
+
+    def set_day(self, dt: date, data: DayData, reason: str = "", extra_info: str = ""):
+        ...
+
+    def get_timer_log(self, dt: date) -> dict[str, int]:
+        ...
+
+    def save_timer_log(self, dt: date, work_s: int, idle_s: int, call_s: int):
+        ...
+
+    def get_day_limit(self, dt: date) -> int:
+        ...
+
+    def day_reason(self, dt: date) -> str:
+        ...
+
+    def get_extra_info(self, dt: date) -> str:
+        ...
+
+    def get_saldo_text(self) -> str:
+        ...
 
 
 def split_reason_and_type(raw_text: str) -> tuple[str, str]:
@@ -296,6 +1016,8 @@ def default_extra_info_color(option: str) -> str:
         "cursus": "#5b6f8f",
         "bijzonder verlof": "#7b5f3e",
         "zwangerschap": "#7a4f79",
+        "ziekte": "#8b3f3f",
+        "tijd voor tijd": "#2f7d4a",
     }
     k = option.strip().casefold()
     if k in preset:
@@ -307,7 +1029,19 @@ def default_extra_info_color(option: str) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+# ============================================================================
+# UI INPUT PRIMITIVES
+# Deze sectie bevat kleine bouwstenen voor invoer en toggles.
+# Het doel is om invoerfouten vroeg te blokkeren zodat latere dialoglogica
+# uit kan gaan van valide waarden en minder defensieve code nodig heeft.
+# ============================================================================
 class HhmmEntryFilter(QObject):
+    """Dwingt hh:mm gedrag af op een QLineEdit.
+
+    We filteren toets-events direct zodat de gebruiker alleen geldige karakters
+    op de juiste positie kan typen. Daardoor hoeven formulieren achteraf
+    minder te repareren en blijft tijdsinvoer overal consistent.
+    """
     DIGIT_POS = (0, 1, 3, 4)
 
     def __init__(self, line_edit: QLineEdit, default: str = "00:00"):
@@ -426,12 +1160,112 @@ def force_hhmm_line_edit(line_edit: QLineEdit, default: str = "00:00"):
     line_edit._hhmm_filter = filt
 
 
+class ModeSwitch(QCheckBox):
+    """Visuele mode-switch voor Uren versus Planning.
+
+    De widget animeert de knoppositie en blendt de track-kleur zodat de
+    context direct zichtbaar is. Dit is bewust custom getekend omdat standaard
+    Qt-checkbox styling te weinig controle gaf over herkenbaarheid.
+    """
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("modeSwitch")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setText("")
+        self.setFixedSize(58, 28)
+        self._offset = 0.0
+        self._anim = QPropertyAnimation(self, b"offset", self)
+        self._anim.setDuration(130)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.toggled.connect(self._on_toggled)
+
+    def _on_toggled(self, checked: bool):
+        self._anim.stop()
+        self._anim.setStartValue(self._offset)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def set_visual_checked(self, checked: bool):
+        self._anim.stop()
+        super().setChecked(bool(checked))
+        self._offset = 1.0 if checked else 0.0
+        self.update()
+
+    def get_offset(self) -> float:
+        return float(self._offset)
+
+    def set_offset(self, value: float):
+        try:
+            v = float(value)
+        except Exception:
+            v = 0.0
+        self._offset = max(0.0, min(1.0, v))
+        self.update()
+
+    offset = Property(float, get_offset, set_offset)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        k = self._offset
+
+        # Track: green (uren) -> blue (planning).
+        tr = int(58 + ((71 - 58) * k))
+        tg = int(111 + ((103 - 111) * k))
+        tb = int(82 + ((138 - 82) * k))
+        track = QColor(tr, tg, tb)
+
+        g = QLinearGradient(r.left(), r.top(), r.left(), r.bottom())
+        g.setColorAt(0.0, track.lighter(118))
+        g.setColorAt(1.0, track.darker(110))
+        p.setBrush(g)
+        p.setPen(QPen(QColor("#2a394a"), 1))
+        p.drawRoundedRect(r, 13, 13)
+
+        d = r.height() - 6
+        x = r.left() + 3 + int((r.width() - d - 6) * k)
+        y = r.top() + 3
+        knob = QRect(x, y, d, d)
+
+        kg = QLinearGradient(knob.left(), knob.top(), knob.left(), knob.bottom())
+        kg.setColorAt(0.0, QColor("#f8fcff"))
+        kg.setColorAt(1.0, QColor("#d4e2f0"))
+        p.setBrush(kg)
+        p.setPen(QPen(QColor("#8aa0b6"), 1))
+        p.drawEllipse(knob)
+
+        inner = knob.adjusted(3, 3, -3, -3)
+        p.setBrush(QColor(255, 255, 255, 52))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(inner)
+
+
 class FramelessDialog(QDialog):
+    """Basis voor frameless dialogs met drag-gedrag.
+
+    Alle popups die dezelfde look-and-feel delen erven hiervan.
+    Zo hoeven we vensterdragging niet in elke dialog afzonderlijk te dupliceren.
+    """
+    INACTIVE_OPACITY = 0.84
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self._drag_active = False
         self._drag_offset = QPoint()
+        app = QApplication.instance()
+        if app is not None and hasattr(app, "applicationStateChanged"):
+            app.applicationStateChanged.connect(self._on_app_state_changed)
+        self._apply_focus_opacity()
+
+    def _on_app_state_changed(self, _state):
+        self._apply_focus_opacity()
+
+    def _apply_focus_opacity(self):
+        app = QApplication.instance()
+        is_active = bool(app is not None and app.applicationState() == Qt.ApplicationActive)
+        self.setWindowOpacity(1.0 if is_active else self.INACTIVE_OPACITY)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -449,6 +1283,18 @@ class FramelessDialog(QDialog):
             self._drag_active = False
         super().mouseReleaseEvent(event)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_focus_opacity()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._apply_focus_opacity()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._apply_focus_opacity()
+
 
 class CalendarCellDelegate(QStyledItemDelegate):
     def __init__(self, owner):
@@ -464,7 +1310,13 @@ class CalendarCellDelegate(QStyledItemDelegate):
             painter.restore()
 
 
-class ExcelStore:
+# ============================================================================
+# STORAGE LAYER (EXCEL)
+# Deze klasse is de enige plek waar direct met openpyxl wordt gewerkt.
+# Door IO en migraties hier te centreren, blijft de UI-laag eenvoudiger en
+# kunnen toekomstige opslagmigraties (bijv. SQLite) gecontroleerd gebeuren.
+# ============================================================================
+class ExcelStore(StorageBackend):
     """Persistente opslaglaag (Excel).
 
     Alle workbook-migraties, normalisatie en IO lopen via deze klasse.
@@ -485,6 +1337,15 @@ class ExcelStore:
         self.extra_info_enabled: list[str] = list(DEFAULT_EXTRA_INFO_OPTIONS)
         self.data_log: dict[str, dict[str, int]] = {}
         self.day_max_minutes = 480
+        self.employment_pct = 100.0
+        self.fulltime_week_minutes = parse_duration_hhmm("38:00", default=2280)
+        self.contract_week_minutes = parse_duration_hhmm("38:00", default=2280)
+        self.contract_year_minutes = parse_duration_hhmm("1938:00", default=116280)
+        self.vacation_stat_minutes = parse_duration_hhmm("152:00", default=9120)
+        self.vacation_extra_minutes = parse_duration_hhmm("56:00", default=3360)
+        self.carry_hours_prev_minutes = 0
+        self.carry_vac_prev_minutes = 0
+        self.workdays_mask = [True, True, True, True, True, False, False]
         self.school_region = "zuid"
         self._load_or_init()
         self.load_all()
@@ -520,6 +1381,15 @@ class ExcelStore:
             ws_set = wb.create_sheet("Instellingen")
             ws_set.append(["key", "value"])
             ws_set.append(["dag_max", "08:00"])
+            ws_set.append(["employment_pct", "100"])
+            ws_set.append(["fulltime_week", "38:00"])
+            ws_set.append(["contract_week", "38:00"])
+            ws_set.append(["contract_year", "1938:00"])
+            ws_set.append(["vacation_stat", "152:00"])
+            ws_set.append(["vacation_extra", "56:00"])
+            ws_set.append(["carry_hours_prev", "0:00"])
+            ws_set.append(["carry_vac_prev", "0:00"])
+            ws_set.append(["workdays_mask", "1111100"])
             ws_ai = wb.create_sheet("AanvullendeInfo")
             ws_ai.append(["optie", "actief"])
             for opt in DEFAULT_EXTRA_INFO_OPTIONS:
@@ -528,13 +1398,16 @@ class ExcelStore:
             ws_aid.append(["datum", "info"])
             ws_log = wb.create_sheet("Data_log")
             ws_log.append(["Datum", "Tijd", "Werk_sec", "Idle_sec", "Call_sec"])
-            wb.save(self.path)
+            save_workbook_atomic(wb, self.path, keep_backup=False)
         self.wb = load_workbook(self.path)
         self.ensure_sheets()
         if created_new:
             self.seed_public_holidays_to_free_days()
             self.seed_school_holidays_from_api(region_filter=None)
-            self.wb.save(self.path)
+            self.safe_save()
+
+    def safe_save(self) -> None:
+        save_workbook_atomic(self.wb, self.path, keep_backup=True)
 
     def ensure_sheets(self):
         if "Planning" not in self.wb.sheetnames:
@@ -563,6 +1436,15 @@ class ExcelStore:
             ws = self.wb.create_sheet("Instellingen")
             ws.append(["key", "value"])
             ws.append(["dag_max", "08:00"])
+            ws.append(["employment_pct", "100"])
+            ws.append(["fulltime_week", "38:00"])
+            ws.append(["contract_week", "38:00"])
+            ws.append(["contract_year", "1938:00"])
+            ws.append(["vacation_stat", "152:00"])
+            ws.append(["vacation_extra", "56:00"])
+            ws.append(["carry_hours_prev", "0:00"])
+            ws.append(["carry_vac_prev", "0:00"])
+            ws.append(["workdays_mask", "1111100"])
         if "AanvullendeInfo" not in self.wb.sheetnames:
             ws = self.wb.create_sheet("AanvullendeInfo")
             ws.append(["optie", "actief"])
@@ -580,7 +1462,7 @@ class ExcelStore:
                 ws.append(["WK"] + WEEKDAYS + ["Wk totaal"])
         self._normalize_planning_sheet()
         self._normalize_workpattern_sheet()
-        self.wb.save(self.path)
+        self.safe_save()
 
     def seed_public_holidays_to_free_days(self):
         ws = self.wb["vrije dagen"]
@@ -733,7 +1615,7 @@ class ExcelStore:
         if not self.school_vakanties:
             added = self.seed_school_holidays_from_api(region_filter=None)
             if added:
-                self.wb.save(self.path)
+                self.safe_save()
                 self.load_school_holidays()
         self.load_extra_info_options()
         self.load_extra_info_data()
@@ -784,7 +1666,7 @@ class ExcelStore:
 
         self.extra_info_options = opts
         self.extra_info_enabled = enabled
-        self.wb.save(self.path)
+        self.safe_save()
 
     def load_extra_info_data(self):
         self.extra_info_data.clear()
@@ -858,10 +1740,223 @@ class ExcelStore:
 
     def load_settings(self):
         ws = self.wb["Instellingen"]
+        found = set()
         for row in ws.iter_rows(min_row=2, values_only=True):
-            if row and row[0] == "dag_max":
-                self.day_max_minutes = hhmm_to_minutes(normalize_hhmm(row[1] or "08:00")) or 480
+            if not row or not row[0]:
+                continue
+            key = str(row[0]).strip()
+            raw = str(row[1] or "").strip()
+            if key == "dag_max":
+                val = normalize_hhmm(raw or "08:00", "08:00")
+                self.day_max_minutes = hhmm_to_minutes(val) or 480
+                found.add(key)
+            elif key == "employment_pct":
+                try:
+                    self.employment_pct = max(0.0, min(200.0, float(raw or "100")))
+                except Exception:
+                    self.employment_pct = 100.0
+                found.add(key)
+            elif key == "fulltime_week":
+                self.fulltime_week_minutes = max(0, parse_duration_hhmm(raw, default=self.fulltime_week_minutes))
+                found.add(key)
+            elif key == "contract_week":
+                self.contract_week_minutes = max(0, parse_duration_hhmm(raw, default=self.contract_week_minutes))
+                found.add(key)
+            elif key == "contract_year":
+                self.contract_year_minutes = max(0, parse_duration_hhmm(raw, default=self.contract_year_minutes))
+                found.add(key)
+            elif key == "vacation_stat":
+                self.vacation_stat_minutes = max(0, parse_duration_hhmm(raw, default=self.vacation_stat_minutes))
+                found.add(key)
+            elif key == "vacation_extra":
+                self.vacation_extra_minutes = max(0, parse_duration_hhmm(raw, default=self.vacation_extra_minutes))
+                found.add(key)
+            elif key == "carry_hours_prev":
+                self.carry_hours_prev_minutes = parse_duration_hhmm(raw, default=0, allow_signed=True)
+                found.add(key)
+            elif key == "carry_vac_prev":
+                self.carry_vac_prev_minutes = parse_duration_hhmm(raw, default=0, allow_signed=True)
+                found.add(key)
+            elif key == "workdays_mask":
+                bits = "".join(ch for ch in raw if ch in "01")
+                if len(bits) >= 7:
+                    self.workdays_mask = [b == "1" for b in bits[:7]]
+                found.add(key)
+        # Migratie/defaults voor oudere bestanden.
+        if "dag_max" not in found:
+            self._set_setting("dag_max", minutes_to_hhmm(self.day_max_minutes or 480))
+        if "employment_pct" not in found:
+            self._set_setting("employment_pct", f"{self.employment_pct:.0f}")
+        if "fulltime_week" not in found:
+            self._set_setting("fulltime_week", format_duration_hhmm(self.fulltime_week_minutes))
+        if "contract_week" not in found:
+            self._set_setting("contract_week", format_duration_hhmm(self.contract_week_minutes))
+        if "contract_year" not in found:
+            self._set_setting("contract_year", format_duration_hhmm(self.contract_year_minutes))
+        if "vacation_stat" not in found:
+            self._set_setting("vacation_stat", format_duration_hhmm(self.vacation_stat_minutes))
+        if "vacation_extra" not in found:
+            self._set_setting("vacation_extra", format_duration_hhmm(self.vacation_extra_minutes))
+        if "carry_hours_prev" not in found:
+            self._set_setting("carry_hours_prev", format_duration_hhmm(self.carry_hours_prev_minutes, signed=True))
+        if "carry_vac_prev" not in found:
+            self._set_setting("carry_vac_prev", format_duration_hhmm(self.carry_vac_prev_minutes, signed=True))
+        if "workdays_mask" not in found:
+            self._set_setting("workdays_mask", "".join("1" if x else "0" for x in self.workdays_mask))
+        self.safe_save()
+
+    def _set_setting(self, key: str, value: str):
+        ws = self.wb["Instellingen"]
+        for row in ws.iter_rows(min_row=2):
+            if str(row[0].value or "").strip() == key:
+                row[1].value = value
                 return
+        ws.append([key, value])
+
+    def save_contract_budget_settings(
+        self,
+        employment_pct: float,
+        fulltime_week: str,
+        contract_year: str,
+        vacation_stat: str,
+        vacation_extra: str,
+        carry_hours_prev: str,
+        carry_vac_prev: str,
+        workdays_mask: list[bool],
+    ):
+        self.employment_pct = max(0.0, min(200.0, float(employment_pct)))
+        self.fulltime_week_minutes = max(0, parse_duration_hhmm(fulltime_week, default=self.fulltime_week_minutes))
+        self.contract_year_minutes = max(0, parse_duration_hhmm(contract_year, default=self.contract_year_minutes))
+        self.contract_week_minutes = int(round(self.fulltime_week_minutes * (self.employment_pct / 100.0)))
+        self.vacation_stat_minutes = max(0, parse_duration_hhmm(vacation_stat, default=self.vacation_stat_minutes))
+        self.vacation_extra_minutes = max(0, parse_duration_hhmm(vacation_extra, default=self.vacation_extra_minutes))
+        self.carry_hours_prev_minutes = parse_duration_hhmm(carry_hours_prev, default=0, allow_signed=True)
+        self.carry_vac_prev_minutes = parse_duration_hhmm(carry_vac_prev, default=0, allow_signed=True)
+        if workdays_mask and len(workdays_mask) >= 7:
+            self.workdays_mask = [bool(x) for x in workdays_mask[:7]]
+
+        self._set_setting("employment_pct", f"{self.employment_pct:.0f}")
+        self._set_setting("fulltime_week", format_duration_hhmm(self.fulltime_week_minutes))
+        self._set_setting("contract_week", format_duration_hhmm(self.contract_week_minutes))
+        self._set_setting("contract_year", format_duration_hhmm(self.contract_year_minutes))
+        self._set_setting("vacation_stat", format_duration_hhmm(self.vacation_stat_minutes))
+        self._set_setting("vacation_extra", format_duration_hhmm(self.vacation_extra_minutes))
+        self._set_setting("carry_hours_prev", format_duration_hhmm(self.carry_hours_prev_minutes, signed=True))
+        self._set_setting("carry_vac_prev", format_duration_hhmm(self.carry_vac_prev_minutes, signed=True))
+        self._set_setting("workdays_mask", "".join("1" if x else "0" for x in self.workdays_mask))
+        self._apply_workdays_mask_to_pattern()
+        self.safe_save()
+
+    def _apply_workdays_mask_to_pattern(self):
+        # Werkdagmasker is leidend voor basisplanning: uitgevinkte dagen worden echt 00:00.
+        # Dit zorgt ervoor dat niet-werkdagen niet per ongeluk uren blijven bevatten uit oude patronen.
+        # Actieve dagen krijgen een evenredige baseline op basis van contract/week.
+        active = [i for i, on in enumerate(self.workdays_mask) if on]
+        if not active:
+            active = [0, 1, 2, 3, 4]
+            self.workdays_mask = [i in active for i in range(7)]
+        per_day = int(round(self.contract_week_minutes / max(1, len(active))))
+        ws = self.wb["Werkpatroon"]
+        idx_to_day = {0: "MA", 1: "DI", 2: "WO", 3: "DO", 4: "VR", 5: "ZA", 6: "ZO"}
+        if ws.max_row > 0:
+            ws.delete_rows(1, ws.max_row)
+        ws.append(["weekdag", "W", "MAX"])
+        for i in range(7):
+            cur = self.weekday_pattern.get(i, {"W": "00:00", "M": "00:00"})
+            if self.workdays_mask[i]:
+                m = max(per_day, hhmm_to_minutes(normalize_hhmm(cur.get("M", "00:00"), "00:00")))
+                w = min(m, max(hhmm_to_minutes(normalize_hhmm(cur.get("W", "00:00"), "00:00")), m))
+                m_txt = minutes_to_hhmm(m)
+                w_txt = minutes_to_hhmm(w)
+            else:
+                w_txt = "00:00"
+                m_txt = "00:00"
+            self.weekday_pattern[i] = {"W": w_txt, "V": "00:00", "Z": "00:00", "M": m_txt}
+            ws.append([idx_to_day[i], w_txt, m_txt])
+
+    def planned_work_minutes_between(self, start: date, end: date) -> int:
+        total = 0
+        for dt in daterange(start, end):
+            if dt.year != self.year:
+                continue
+            d = self.get_day(dt)
+            total += hhmm_to_minutes(d.w)
+        return total
+
+    def planned_free_minutes_between(self, start: date, end: date) -> int:
+        total = 0
+        for dt in daterange(start, end):
+            if dt.year != self.year:
+                continue
+            d = self.get_day(dt)
+            total += hhmm_to_minutes(d.v) + hhmm_to_minutes(d.z)
+        return total
+
+    def annual_required_minutes(self) -> int:
+        return max(0, int(self.contract_year_minutes))
+
+    def illness_reduction_minutes_between(self, start: date, end: date) -> int:
+        """Aantal minuten dat van plan-noodzaak afgaat door ziekte-markeringen."""
+        total = 0
+        for dt in daterange(start, end):
+            key = dt.strftime("%Y-%m-%d")
+            info = str(self.extra_info_data.get(key, "") or "").strip().casefold()
+            if info != "ziekte":
+                continue
+            day_limit = self.get_day_limit(dt)
+            if day_limit <= 0:
+                continue
+            total += day_limit
+        return total
+
+    def get_budget_overview(self) -> dict[str, int]:
+        # We rekenen jaarbudget en verlofbudget vanuit geplande data, niet vanuit gewerkte data.
+        # Daarmee blijft dit blok een planning-instrument: "wat heb ik nog te plannen / over".
+        # Carry-over wordt expliciet meegenomen zodat de jaarstartpositie klopt.
+        start = date(self.year, 1, 1)
+        end = date(self.year, 12, 31)
+        planned_work = self.planned_work_minutes_between(start, end)
+        planned_free = self.planned_free_minutes_between(start, end)
+        illness_reduction = self.illness_reduction_minutes_between(start, end)
+        required = self.annual_required_minutes()
+        target = max(0, required + self.carry_hours_prev_minutes - illness_reduction)
+        to_plan = max(0, target - planned_work)
+
+        stat_total = max(0, self.vacation_stat_minutes)
+        extra_total_raw = self.vacation_extra_minutes + self.carry_vac_prev_minutes
+        if extra_total_raw < 0:
+            stat_total = max(0, stat_total + extra_total_raw)
+            extra_total = 0
+        else:
+            extra_total = extra_total_raw
+        stat_used = min(stat_total, planned_free)
+        extra_used = min(extra_total, max(0, planned_free - stat_total))
+        return {
+            "employment_pct": int(round(self.employment_pct)),
+            "fulltime_week": self.fulltime_week_minutes,
+            "contract_week": self.contract_week_minutes,
+            "contract_year": required,
+            "carry_hours_prev": self.carry_hours_prev_minutes,
+            "carry_vac_prev": self.carry_vac_prev_minutes,
+            "illness_reduction_year": illness_reduction,
+            "required_year": required,
+            "planned_year": planned_work,
+            "target_year": target,
+            "to_plan_year": to_plan,
+            "vacation_planned": planned_free,
+            "vacation_stat_total": stat_total,
+            "vacation_extra_total": extra_total,
+            "vacation_stat_left": max(0, stat_total - stat_used),
+            "vacation_extra_left": max(0, extra_total - extra_used),
+        }
+
+    def get_vacation_budget_text(self) -> str:
+        b = self.get_budget_overview()
+        return (
+            f"Vrij-budget: wettelijk over {minutes_to_hhmm(b['vacation_stat_left'])} / "
+            f"bovenwettelijk over {minutes_to_hhmm(b['vacation_extra_left'])} "
+            f"(ingepland vrij {minutes_to_hhmm(b['vacation_planned'])})"
+        )
 
     def load_free_days(self):
         self.vakantie_dagen.clear()
@@ -939,6 +2034,7 @@ class ExcelStore:
         if today.year != self.year:
             return
         ws = self.wb[MONTHS_NL[today.month - 1]]
+        changed = False
         for row in ws.iter_rows(min_row=2):
             wk = row[0].value
             if not isinstance(wk, str) or not wk.startswith("wk"):
@@ -953,9 +2049,18 @@ class ExcelStore:
                 except ValueError:
                     continue
                 if dt == today:
-                    row[c + 1].fill = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-        ws.sheet_properties.tabColor = "ADD8E6"
-        self.wb.save(self.path)
+                    cell = row[c + 1]
+                    cur = str(getattr(cell.fill, "start_color", None).rgb or "").upper()
+                    if "ADD8E6" not in cur:
+                        cell.fill = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
+                        changed = True
+                    break
+        cur_tab = str(getattr(ws.sheet_properties, "tabColor", None) or "")
+        if "ADD8E6" not in cur_tab.upper():
+            ws.sheet_properties.tabColor = "ADD8E6"
+            changed = True
+        if changed:
+            self.safe_save()
 
     def get_day(self, dt: date) -> DayData:
         key = dt.strftime("%Y-%m-%d")
@@ -983,7 +2088,7 @@ class ExcelStore:
         worked = seconds_to_hhmmss(seconds)
         self.worked_data[key] = worked
         self._save_worked_cell(dt, worked)
-        self.wb.save(self.path)
+        self.safe_save()
 
     def save_timer_log(self, dt: date, work_s: int, idle_s: int, call_s: int):
         key = dt.strftime("%Y-%m-%d")
@@ -1021,12 +2126,16 @@ class ExcelStore:
             abs_val = data.v if hhmm_to_minutes(data.v) > 0 else data.z
             text = f"{abs_val} vrij"
             details = (reason or "").strip()
+            # Op officiële feestdagen houden we de feestdagnaam vast als reden
+            # zodra er vrij gepland is en de gebruiker geen expliciete reden invult.
+            if not details and dt in self.nl_holidays:
+                details = str(self.nl_holidays.get(dt) or "").strip()
             if details:
                 text = f"{text} - {details}"
             self._save_free_day(dt, text)
         else:
             self._delete_free_day(dt)
-        self.wb.save(self.path)
+        self.safe_save()
 
     def _save_planning_row(self, dt: date, d: DayData):
         ws = self.wb["Planning"]
@@ -1096,7 +2205,7 @@ class ExcelStore:
             return str(self.nl_holidays.get(dt) or "")
         return ""
 
-    def get_saldo_text(self) -> str:
+    def get_saldo_minutes(self) -> int:
         norm = 0
         free = 0
         worked = 0
@@ -1110,19 +2219,47 @@ class ExcelStore:
             free += hhmm_to_minutes(d.v)
             worked += hhmm_to_minutes(d.worked)
         expected = max(0, norm - free)
-        diff = worked - expected
+        return worked - expected
+
+    def get_saldo_text(self) -> str:
+        diff = self.get_saldo_minutes()
+        norm = 0
+        free = 0
+        worked = 0
+        daily = int((38 * 60) / 5)
+        start = date(self.year, 1, 1)
+        end = min(date.today(), date(self.year, 12, 31))
+        for dt in daterange(start, end):
+            if dt.weekday() < 5 and dt not in self.nl_holidays:
+                norm += daily
+            d = self.get_day(dt)
+            free += hhmm_to_minutes(d.v)
+            worked += hhmm_to_minutes(d.worked)
+        expected = max(0, norm - free)
         sign = "+" if diff >= 0 else "-"
         return f"Saldo {sign}{minutes_to_hhmm(abs(diff))} (gewerkt {minutes_to_hhmm(worked)} / norm {minutes_to_hhmm(expected)})"
 
     def export_copy(self) -> str:
-        self.wb.save(self.path)
+        self.safe_save()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         dst = os.path.join(self.base_dir, f"Time_tabel_{self.year}_export_{stamp}.xlsx")
         shutil.copy2(self.path, dst)
         return dst
 
 
+# ============================================================================
+# DIALOGS EN POPUPS
+# Alle modale invoervensters staan hieronder gegroepeerd.
+# Deze dialogs zijn bewust klein gehouden: één duidelijk doel per popup, met
+# lokale validatie, zodat de hoofdlogica in MainWindow overzichtelijk blijft.
+# ============================================================================
 class DayEditDialog(FramelessDialog):
+    """Dialog voor één kalenderdag (uren, vrij, gewerkt en context-info).
+
+    Dit is het primaire handmatige correctiepunt van de app. De dialog doet
+    daarom zowel validatie als budgetzicht, zodat een gebruiker direct ziet
+    wat de impact is voordat de wijziging wordt opgeslagen.
+    """
     def __init__(
         self,
         parent: QWidget,
@@ -1133,6 +2270,8 @@ class DayEditDialog(FramelessDialog):
         current_extra_info: str = "",
         extra_info_options: list[str] | None = None,
         extra_info_colors: dict[str, str] | None = None,
+        free_budget_text: str = "",
+        allow_tvt: bool = True,
     ):
         super().__init__(parent)
         self.setWindowTitle(f"Dag bewerken - {dt.strftime('%d-%m-%Y')}")
@@ -1145,9 +2284,12 @@ class DayEditDialog(FramelessDialog):
 
         self.e_w = QLineEdit(day_data.w)
         self.e_v = QLineEdit(day_data.v)
+        self.e_worked = QLineEdit(normalize_hhmm(day_data.worked, "00:00"))
         self.e_reason = QLineEdit()
 
         self.extra_options = normalize_extra_info_options(extra_info_options)
+        if not allow_tvt:
+            self.extra_options = [o for o in self.extra_options if o.strip().casefold() != "tijd voor tijd"]
         self.extra_info_colors = dict(extra_info_colors or {})
         existing_type, existing_reason = split_reason_and_type(current_reason)
         selected_extra = current_extra_info.strip()
@@ -1173,7 +2315,7 @@ class DayEditDialog(FramelessDialog):
             chip_grid.addWidget(btn, idx // cols, idx % cols)
 
         self.e_reason.setText(existing_reason)
-        for w in (self.e_w, self.e_v):
+        for w in (self.e_w, self.e_v, self.e_worked):
             w.setPlaceholderText("hh:mm")
             force_hhmm_line_edit(w)
         self._syncing = False
@@ -1186,6 +2328,7 @@ class DayEditDialog(FramelessDialog):
         form = QFormLayout()
         form.addRow("Werk (W)", self.e_w)
         form.addRow("Vrij (V)", self.e_v)
+        form.addRow("Gewerkt (handmatig)", self.e_worked)
         form.addRow("Aanvullende informatie", self.extra_host)
         form.addRow("Reden vrij", self.e_reason)
 
@@ -1206,6 +2349,11 @@ class DayEditDialog(FramelessDialog):
         root.addWidget(QLabel(f"Daglimiet: {minutes_to_hhmm(day_limit)}"))
         self.lbl_total = QLabel("")
         root.addWidget(self.lbl_total)
+        if free_budget_text.strip():
+            lbl_budget = QLabel(free_budget_text.strip())
+            lbl_budget.setWordWrap(True)
+            lbl_budget.setStyleSheet("color:#b8c7d8;")
+            root.addWidget(lbl_budget)
         root.addLayout(row)
         self.resize(560, 320)
         self.e_w.editingFinished.connect(lambda: self._rebalance("w"))
@@ -1279,8 +2427,8 @@ class DayEditDialog(FramelessDialog):
         w = normalize_hhmm(self.e_w.text())
         v = normalize_hhmm(self.e_v.text())
         z = "00:00"
-        worked = normalize_hhmm(self.existing_worked, "")
-        for x in (w, v):
+        worked = normalize_hhmm(self.e_worked.text(), "00:00")
+        for x in (w, v, worked):
             if not parse_hhmm_strict(x):
                 QMessageBox.warning(self, "Fout", "Gebruik hh:mm (00:00 t/m 23:59).")
                 return
@@ -1296,10 +2444,13 @@ class DayEditDialog(FramelessDialog):
 
 class MonthCard(QGroupBox):
     day_double_clicked = Signal(date)
+    day_range_selected = Signal(date, date)
+    day_clicked = Signal(date, bool)
+    day_shift_double_clicked = Signal(date)
 
     def __init__(
         self,
-        store: ExcelStore,
+        store: StorageBackend,
         year: int,
         month: int,
         mode: str,
@@ -1316,7 +2467,7 @@ class MonthCard(QGroupBox):
         self.mode = mode
         self.focus_mode = focus_mode
         self.dark_mode = dark_mode
-        self.colors = colors or dict(COLOR_DEFAULTS)
+        self.colors = colors or dict(PLANNED_COLOR_DEFAULTS)
         self.extra_info_colors = dict(extra_info_colors or {})
         self.cell_map: dict[tuple[int, int], date] = {}
         self.table = QTableWidget(self)
@@ -1324,13 +2475,15 @@ class MonthCard(QGroupBox):
         self.table.setHorizontalHeaderLabels(["WK"] + WEEKDAYS + ["Wk totaal"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.table.setAlternatingRowColors(True)
         self.table.setMouseTracking(True)
         self.table.setShowGrid(False)
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.table.setItemDelegate(CalendarCellDelegate(self))
+        self.table.cellClicked.connect(self._on_click)
         self.table.cellDoubleClicked.connect(self._on_double)
         self.table.setMinimumHeight(560 if focus_mode else 220)
         self.table.horizontalHeader().setMinimumSectionSize(70)
@@ -1364,8 +2517,17 @@ class MonthCard(QGroupBox):
         key = dt.strftime("%Y-%m-%d")
         if dt == date.today():
             return QColor(self.colors["bg_today_dark"])
-        if key in self.store.vakantie_dagen:
-            return QColor(self.colors["bg_vacation_dark"])
+        mode = getattr(self, "mode", "planned")
+        if mode == "worked":
+            # In Uren-weergave tonen we geen "vrij"-achtergrond voor geplande vrije dagen.
+            # Zo blijft deze view primair een gewerkt-uren overzicht.
+            if dt in self.store.nl_holidays:
+                return QColor(self.colors["bg_holiday_dark"])
+            if key in self.store.school_vakanties:
+                return QColor(self.colors["bg_school_dark"])
+            if dt.weekday() >= 5:
+                return QColor(self.colors["bg_weekend_dark"])
+            return QColor(self.colors["bg_default_dark"])
         if dt in self.store.nl_holidays:
             return QColor(self.colors["bg_holiday_dark"])
         if key in self.store.school_vakanties:
@@ -1383,12 +2545,25 @@ class MonthCard(QGroupBox):
                 return v
         return None
 
-    def _planned_hours_brush(self, dt: date, fallback: QColor) -> QBrush:
-        info = self.store.get_extra_info(dt).strip()
+    def _worked_hours_base_bg(self, dt: date) -> QColor:
+        """Basis-achtergrond voor urenblok in Uren-tab (zonder geplande-vrij override)."""
+        key = dt.strftime("%Y-%m-%d")
+        if dt == date.today():
+            return QColor(self.colors["bg_today_dark"])
+        if dt in self.store.nl_holidays:
+            return QColor(self.colors["bg_holiday_dark"])
+        if key in self.store.school_vakanties:
+            return QColor(self.colors["bg_school_dark"])
+        if dt.weekday() >= 5:
+            return QColor(self.colors["bg_weekend_dark"])
+        return QColor(self.colors["bg_default_dark"])
+
+    def _planned_hours_brush(self, dt: date, fallback: QColor, day_data: DayData | None = None, info: str | None = None) -> QBrush:
+        info = (info if info is not None else self.store.get_extra_info(dt)).strip()
         override = self._extra_info_color(info)
         if override:
             return QBrush(QColor(override))
-        d = self.store.get_day(dt)
+        d = day_data or self.store.get_day(dt)
         w_m = hhmm_to_minutes(d.w)
         v_m = hhmm_to_minutes(d.v)
         total = w_m + v_m + hhmm_to_minutes(d.z)
@@ -1412,8 +2587,31 @@ class MonthCard(QGroupBox):
             return QBrush(free_clr)
         return QBrush(fallback)
 
-    def _hours_text(self, dt: date) -> str:
-        d = self.store.get_day(dt)
+    def _worked_hours_brush(self, dt: date, fallback: QColor, day_data: DayData | None = None) -> QBrush:
+        """Uren-tab: toon vrij-aandeel als blend op de standaard urenachtergrond."""
+        d = day_data or self.store.get_day(dt)
+        w_m = hhmm_to_minutes(d.w)
+        v_m = hhmm_to_minutes(d.v) + hhmm_to_minutes(d.z)
+        total = w_m + v_m
+        if total <= 0 or v_m <= 0:
+            return QBrush(fallback)
+        base_clr = QColor(fallback)
+        free_clr = QColor(self.colors["planned_free_bg_dark"])
+        if v_m >= total:
+            return QBrush(free_clr)
+
+        free_ratio = v_m / max(1, total)
+        stop = max(0.05, min(0.95, free_ratio))
+        grad = QLinearGradient(0.0, 0.0, 1.0, 0.0)
+        grad.setCoordinateMode(QGradient.ObjectBoundingMode)
+        grad.setColorAt(0.0, free_clr)
+        grad.setColorAt(stop, free_clr)
+        grad.setColorAt(min(1.0, stop + 0.001), base_clr)
+        grad.setColorAt(1.0, base_clr)
+        return QBrush(grad)
+
+    def _hours_text(self, dt: date, day_data: DayData | None = None) -> str:
+        d = day_data or self.store.get_day(dt)
         if self.mode == "planned":
             total = hhmm_to_minutes(d.w) + hhmm_to_minutes(d.v) + hhmm_to_minutes(d.z)
             if total == 0:
@@ -1421,16 +2619,15 @@ class MonthCard(QGroupBox):
                 return reason[:18] if reason else "00:00"
             return minutes_to_hhmm(total)
         if hhmm_to_minutes(d.w) == 0 and hhmm_to_minutes(d.v) > 0:
-            reason = self.store.day_reason(dt)
-            return f"{d.v}\n{reason[:14]}" if reason else d.v
+            return d.v
         return d.worked or "00:00"
 
-    def _day_number_color(self, dt: date) -> QColor:
+    def _day_number_color(self, dt: date, day_data: DayData | None = None) -> QColor:
         key = dt.strftime("%Y-%m-%d")
         if dt == date.today():
             return QColor(self.colors["daynum_today_dark"])
         if self.mode == "planned":
-            d = self.store.get_day(dt)
+            d = day_data or self.store.get_day(dt)
             has_planning = (hhmm_to_minutes(d.w) + hhmm_to_minutes(d.v) + hhmm_to_minutes(d.z)) > 0
             if has_planning:
                 if dt in self.store.nl_holidays:
@@ -1445,8 +2642,6 @@ class MonthCard(QGroupBox):
             return QColor(self.colors["daynum_default_dark"])
         if dt in self.store.nl_holidays:
             return QColor(self.colors["daynum_holiday_dark"])
-        if key in self.store.vakantie_dagen:
-            return QColor(self.colors["daynum_vacation_dark"])
         if key in self.store.school_vakanties:
             return QColor(self.colors["daynum_school_dark"])
         if dt.weekday() >= 5:
@@ -1454,140 +2649,199 @@ class MonthCard(QGroupBox):
         return QColor(self.colors["daynum_default_dark"])
 
     def refresh(self):
-        total_label = "Gepland" if self.mode == "planned" else "Gewerkt"
-        self.table.setHorizontalHeaderLabels(["WK"] + WEEKDAYS + [total_label])
-        weeks = self._weeks()
-        self.table.clearSpans()
-        self.table.setRowCount(len(weeks) * 2)
-        self.cell_map.clear()
-        day_h = 36 if self.focus_mode else 18
-        hour_h = 64 if self.focus_mode else 24
-        for week_i, (week_no, week_days) in enumerate(weeks):
-            day_row = week_i * 2
-            hour_row = day_row + 1
-            self.table.setRowHeight(day_row, day_h)
-            self.table.setRowHeight(hour_row, hour_h)
+        self.table.setUpdatesEnabled(False)
+        self.table.viewport().setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            total_label = "Gepland" if self.mode == "planned" else "Gewerkt"
+            self.table.setHorizontalHeaderLabels(["WK"] + WEEKDAYS + [total_label])
+            weeks = self._weeks()
+            target_rows = len(weeks) * 2
+            structure_changed = self.table.rowCount() != target_rows
+            if structure_changed:
+                self.table.clearSpans()
+                self.table.setRowCount(target_rows)
+            self.cell_map.clear()
+            day_h = 36 if self.focus_mode else 18
+            hour_h = 64 if self.focus_mode else 24
+            for week_i, (week_no, week_days) in enumerate(weeks):
+                day_row = week_i * 2
+                hour_row = day_row + 1
+                if structure_changed:
+                    self.table.setRowHeight(day_row, day_h)
+                    self.table.setRowHeight(hour_row, hour_h)
 
-            wk = QTableWidgetItem(f"wk{week_no}" if week_no is not None else "")
-            wk.setTextAlignment(Qt.AlignCenter)
-            wk.setBackground(QColor(self.colors["weeknum_bg_dark"]))
-            wk.setForeground(QColor(self.colors["weeknum_fg_dark"]))
-            wk.setData(Qt.UserRole, True)
-            self.table.setItem(day_row, 0, wk)
-            self.table.setSpan(day_row, 0, 2, 1)
+                wk = self.table.item(day_row, 0)
+                if wk is None:
+                    wk = QTableWidgetItem("")
+                    self.table.setItem(day_row, 0, wk)
+                wk.setText(f"wk{week_no}" if week_no is not None else "")
+                wk.setTextAlignment(Qt.AlignCenter)
+                wk.setBackground(QColor(self.colors["weeknum_bg_dark"]))
+                wk.setForeground(QColor(self.colors["weeknum_fg_dark"]))
+                wk.setData(Qt.UserRole, True)
+                if structure_changed:
+                    self.table.setSpan(day_row, 0, 2, 1)
 
-            total_min = 0
-            iso_year = None
-            iso_week = None
-            seed_dt = next((x for x in week_days if x is not None), None)
-            if seed_dt:
-                iso = seed_dt.isocalendar()
-                iso_year, iso_week = iso[0], iso[1]
-            for wd, dt in enumerate(week_days):
-                c = wd + 1
-                day_item = QTableWidgetItem("")
-                day_item.setTextAlignment(Qt.AlignCenter)
-                hours_item = QTableWidgetItem("")
-                hours_item.setTextAlignment(Qt.AlignCenter)
-                if dt:
-                    bg = self._bg(dt)
-                    day_item.setText(str(dt.day))
-                    day_item.setBackground(bg)
-                    day_item.setForeground(self._day_number_color(dt))
-                    hours_item.setText(self._hours_text(dt))
-                    hours_item.setBackground(self._planned_hours_brush(dt, bg))
-                    hours_item.setForeground(QColor(self.colors["hours_fg_dark"]))
-                    day_item.setData(Qt.UserRole, True)
-                    hours_item.setData(Qt.UserRole, True)
-                    reason = self.store.day_reason(dt)
-                    if not reason and dt.strftime("%Y-%m-%d") in self.store.school_vakanties:
-                        reason = self.store.school_vakanties.get(dt.strftime("%Y-%m-%d"), "")
-                    if reason:
-                        day_item.setToolTip(reason)
-                        hours_item.setToolTip(reason)
-                    self.cell_map[(day_row, c)] = dt
-                    self.cell_map[(hour_row, c)] = dt
-                    day = self.store.get_day(dt)
-                    if self.mode == "planned":
-                        total_min += hhmm_to_minutes(day.w) + hhmm_to_minutes(day.v) + hhmm_to_minutes(day.z)
+                total_min = 0
+                iso_year = None
+                iso_week = None
+                seed_dt = next((x for x in week_days if x is not None), None)
+                if seed_dt:
+                    iso = seed_dt.isocalendar()
+                    iso_year, iso_week = iso[0], iso[1]
+                for wd, dt in enumerate(week_days):
+                    c = wd + 1
+                    day_item = self.table.item(day_row, c)
+                    if day_item is None:
+                        day_item = QTableWidgetItem("")
+                        self.table.setItem(day_row, c, day_item)
+                    hours_item = self.table.item(hour_row, c)
+                    if hours_item is None:
+                        hours_item = QTableWidgetItem("")
+                        self.table.setItem(hour_row, c, hours_item)
+                    day_item.setTextAlignment(Qt.AlignCenter)
+                    hours_item.setTextAlignment(Qt.AlignCenter)
+                    if dt:
+                        day_data = self.store.get_day(dt)
+                        info = self.store.get_extra_info(dt)
+                        bg = self._bg(dt)
+                        day_item.setText(str(dt.day))
+                        day_item.setBackground(bg)
+                        day_item.setForeground(self._day_number_color(dt, day_data))
+                        hours_item.setText(self._hours_text(dt, day_data))
+                        if self.mode == "planned":
+                            hours_item.setBackground(self._planned_hours_brush(dt, bg, day_data, info))
+                        else:
+                            base_bg = self._worked_hours_base_bg(dt)
+                            hours_item.setBackground(self._worked_hours_brush(dt, base_bg, day_data))
+                        hours_item.setForeground(QColor(self.colors["hours_fg_dark"]))
+                        day_item.setData(Qt.UserRole, True)
+                        hours_item.setData(Qt.UserRole, True)
+                        reason = self.store.day_reason(dt)
+                        if not reason and dt.strftime("%Y-%m-%d") in self.store.school_vakanties:
+                            reason = self.store.school_vakanties.get(dt.strftime("%Y-%m-%d"), "")
+                        if reason:
+                            day_item.setToolTip(reason)
+                            hours_item.setToolTip(reason)
+                        else:
+                            day_item.setToolTip("")
+                            hours_item.setToolTip("")
+                        self.cell_map[(day_row, c)] = dt
+                        self.cell_map[(hour_row, c)] = dt
+                        if self.mode == "planned":
+                            total_min += hhmm_to_minutes(day_data.w) + hhmm_to_minutes(day_data.v) + hhmm_to_minutes(day_data.z)
+                        else:
+                            total_min += hhmm_to_minutes(day_data.worked)
                     else:
-                        total_min += hhmm_to_minutes(day.worked)
+                        blank = QColor(self.colors["empty_bg_dark"])
+                        day_item.setText("")
+                        hours_item.setText("")
+                        day_item.setBackground(blank)
+                        hours_item.setBackground(blank)
+                        day_item.setData(Qt.UserRole, False)
+                        hours_item.setData(Qt.UserRole, False)
+                        day_item.setToolTip("")
+                        hours_item.setToolTip("")
+
+                if iso_year is not None and iso_week is not None:
+                    week_total = 0
+                    for d in range(1, 8):
+                        try:
+                            wdt = date.fromisocalendar(iso_year, iso_week, d)
+                        except ValueError:
+                            continue
+                        day = self.store.get_day(wdt)
+                        if self.mode == "planned":
+                            week_total += hhmm_to_minutes(day.w) + hhmm_to_minutes(day.v) + hhmm_to_minutes(day.z)
+                        else:
+                            week_total += hhmm_to_minutes(day.worked)
+                    tot_txt = minutes_to_hhmm(week_total)
                 else:
-                    blank = QColor(self.colors["empty_bg_dark"])
-                    day_item.setBackground(blank)
-                    hours_item.setBackground(blank)
-                    day_item.setData(Qt.UserRole, False)
-                    hours_item.setData(Qt.UserRole, False)
-                self.table.setItem(day_row, c, day_item)
-                self.table.setItem(hour_row, c, hours_item)
+                    tot_txt = minutes_to_hhmm(total_min)
+                tot = self.table.item(day_row, 8)
+                if tot is None:
+                    tot = QTableWidgetItem("")
+                    self.table.setItem(day_row, 8, tot)
+                tot.setText(tot_txt)
+                tot.setTextAlignment(Qt.AlignCenter)
+                tot.setBackground(QColor(self.colors["weektotal_bg_dark"]))
+                tot.setForeground(QColor(self.colors["weektotal_fg_dark"]))
+                tot.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                tot.setData(Qt.UserRole, True)
+                if structure_changed:
+                    self.table.setSpan(day_row, 8, 2, 1)
 
-            if iso_year is not None and iso_week is not None:
-                week_total = 0
-                for d in range(1, 8):
-                    try:
-                        wdt = date.fromisocalendar(iso_year, iso_week, d)
-                    except ValueError:
-                        continue
-                    day = self.store.get_day(wdt)
-                    if self.mode == "planned":
-                        week_total += hhmm_to_minutes(day.w) + hhmm_to_minutes(day.v) + hhmm_to_minutes(day.z)
-                    else:
-                        week_total += hhmm_to_minutes(day.worked)
-                tot_txt = minutes_to_hhmm(week_total)
-            else:
-                tot_txt = minutes_to_hhmm(total_min)
-            tot = QTableWidgetItem(tot_txt)
-            tot.setTextAlignment(Qt.AlignCenter)
-            tot.setBackground(QColor(self.colors["weektotal_bg_dark"]))
-            tot.setForeground(QColor(self.colors["weektotal_fg_dark"]))
-            tot.setFont(QFont("Segoe UI", 9, QFont.Bold))
-            tot.setData(Qt.UserRole, True)
-            self.table.setItem(day_row, 8, tot)
-            self.table.setSpan(day_row, 8, 2, 1)
+            if structure_changed:
+                if self.focus_mode:
+                    self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+                    self.table.setColumnWidth(0, 92)
+                    for c in range(1, 8):
+                        self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
+                    self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
+                    self.table.setColumnWidth(8, 132)
+                else:
+                    self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+                    self.table.setColumnWidth(0, 56)
+                    for c in range(1, 8):
+                        self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Fixed)
+                        self.table.setColumnWidth(c, 66)
+                    self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
+                    self.table.setColumnWidth(8, 106)
 
-        if self.focus_mode:
-            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
-            self.table.setColumnWidth(0, 92)
-            for c in range(1, 8):
-                self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
-            self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
-            self.table.setColumnWidth(8, 132)
-        else:
-            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
-            self.table.setColumnWidth(0, 56)
-            for c in range(1, 8):
-                self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Fixed)
-                self.table.setColumnWidth(c, 66)
-            self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
-            self.table.setColumnWidth(8, 106)
-
-        total_h = self.table.horizontalHeader().height()
-        for r in range(self.table.rowCount()):
-            total_h += self.table.rowHeight(r)
-        total_h += 8
-        self.table.setMinimumHeight(total_h)
-        self.table.setMaximumHeight(total_h)
-        if not self.focus_mode:
-            # Gebruik vaste hoogte op basis van 6 weekrijen zonder extra lege rasterrijen.
-            header_h = self.table.horizontalHeader().height()
-            fixed_h = header_h + (6 * (18 + 24)) + 8
-            self.table.setMinimumHeight(fixed_h)
-            self.table.setMaximumHeight(fixed_h)
-            self.setMinimumHeight(fixed_h + 56)
-            self.setMaximumHeight(fixed_h + 56)
+                total_h = self.table.horizontalHeader().height()
+                for r in range(self.table.rowCount()):
+                    total_h += self.table.rowHeight(r)
+                total_h += 8
+                self.table.setMinimumHeight(total_h)
+                self.table.setMaximumHeight(total_h)
+                if not self.focus_mode:
+                    # Gebruik vaste hoogte op basis van 6 weekrijen zonder extra lege rasterrijen.
+                    header_h = self.table.horizontalHeader().height()
+                    fixed_h = header_h + (6 * (18 + 24)) + 8
+                    self.table.setMinimumHeight(fixed_h)
+                    self.table.setMaximumHeight(fixed_h)
+                    self.setMinimumHeight(fixed_h + 56)
+                    self.setMaximumHeight(fixed_h + 56)
+        finally:
+            self.table.blockSignals(False)
+            self.table.viewport().setUpdatesEnabled(True)
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
 
     def _on_double(self, row: int, col: int):
         dt = self.cell_map.get((row, col))
-        if dt and self.mode == "planned":
+        if dt:
+            mods = QApplication.keyboardModifiers()
+            if mods & Qt.ShiftModifier:
+                self.day_shift_double_clicked.emit(dt)
+                return
             self.day_double_clicked.emit(dt)
+
+    def _on_click(self, row: int, col: int):
+        dt = self.cell_map.get((row, col))
+        if not dt:
+            return
+        mods = QApplication.keyboardModifiers()
+        self.day_clicked.emit(dt, bool(mods & Qt.ShiftModifier))
+
+    def select_date_range(self, start_dt: date, end_dt: date):
+        a, b = (start_dt, end_dt) if start_dt <= end_dt else (end_dt, start_dt)
+        self.table.clearSelection()
+        for (row, col), dt in self.cell_map.items():
+            if a <= dt <= b:
+                item = self.table.item(row, col)
+                if item is not None:
+                    item.setSelected(True)
 
 
 class CalendarBoard(QWidget):
     day_double_clicked = Signal(date)
+    day_range_selected = Signal(date, date)
 
     def __init__(
         self,
-        store: ExcelStore,
+        store: StorageBackend,
         year: int,
         mode: str,
         months: list[int],
@@ -1606,9 +2860,10 @@ class CalendarBoard(QWidget):
         self._active_per_row = per_row
         self.focus_mode = focus_mode
         self.dark_mode = dark_mode
-        self.colors = colors or dict(COLOR_DEFAULTS)
+        self.colors = colors or dict(PLANNED_COLOR_DEFAULTS)
         self.extra_info_colors = dict(extra_info_colors or {})
         self.cards: list[MonthCard] = []
+        self._bulk_anchor_date: date | None = None
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(8)
@@ -1647,6 +2902,8 @@ class CalendarBoard(QWidget):
                 extra_info_colors=self.extra_info_colors,
             )
             card.day_double_clicked.connect(self.day_double_clicked.emit)
+            card.day_clicked.connect(self._on_card_day_clicked)
+            card.day_shift_double_clicked.connect(self._on_card_day_shift_double)
             self.cards.append(card)
             self.grid.addWidget(card, i // cols, i % cols)
         for c in range(cols):
@@ -1656,7 +2913,6 @@ class CalendarBoard(QWidget):
         self.mode = mode
         for c in self.cards:
             c.mode = mode
-            c.refresh()
 
     def set_month(self, month: int):
         self.months = [month]
@@ -1664,26 +2920,49 @@ class CalendarBoard(QWidget):
         self.rebuild()
 
     def refresh(self):
+        self.setUpdatesEnabled(False)
+        try:
+            for c in self.cards:
+                c.refresh()
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def _select_range_all_cards(self, start_dt: date, end_dt: date):
         for c in self.cards:
-            c.refresh()
+            c.select_date_range(start_dt, end_dt)
+
+    def _on_card_day_clicked(self, dt: date, shift: bool):
+        if shift and self._bulk_anchor_date is not None:
+            a = self._bulk_anchor_date
+            self._select_range_all_cards(min(a, dt), max(a, dt))
+            return
+        self._bulk_anchor_date = dt
+        self._select_range_all_cards(dt, dt)
+
+    def _on_card_day_shift_double(self, dt: date):
+        if self._bulk_anchor_date is None:
+            self._bulk_anchor_date = dt
+            self._select_range_all_cards(dt, dt)
+            return
+        a = self._bulk_anchor_date
+        s, e = (min(a, dt), max(a, dt))
+        self._select_range_all_cards(s, e)
+        self.day_range_selected.emit(s, e)
 
     def set_dark_mode(self, enabled: bool):
         self.dark_mode = enabled
         for c in self.cards:
             c.dark_mode = enabled
-            c.refresh()
 
     def set_colors(self, colors: dict[str, str]):
         self.colors = colors
         for c in self.cards:
             c.colors = colors
-            c.refresh()
 
     def set_extra_info_colors(self, extra_info_colors: dict[str, str]):
         self.extra_info_colors = dict(extra_info_colors or {})
         for c in self.cards:
             c.extra_info_colors = dict(self.extra_info_colors)
-            c.refresh()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1691,7 +2970,13 @@ class CalendarBoard(QWidget):
 
 
 class WorkPatternDialog(FramelessDialog):
-    def __init__(self, parent: QWidget, store: ExcelStore, year: int, apply_callback=None):
+    """Instellingen voor weekpatroon en dagmax op datumrange.
+
+    Dit venster beheert vaste basiswaarden waarmee planning en normberekening
+    gevoed worden. Het opsplitsen in een aparte dialog voorkomt dat de hoofd-UI
+    te druk wordt met zeldzaam gebruikte configuratievelden.
+    """
+    def __init__(self, parent: QWidget, store: StorageBackend, year: int, apply_callback=None):
         super().__init__(parent)
         self.store = store
         self.year = year
@@ -1793,7 +3078,7 @@ class WorkPatternDialog(FramelessDialog):
                 return False
             self.store.weekday_pattern[i] = {"W": w, "V": "00:00", "Z": "00:00", "M": m}
             ws.append([idx_to_day[i], w, m])
-        self.store.wb.save(self.store.path)
+        self.store.safe_save()
         return True
 
 
@@ -1823,6 +3108,12 @@ class ColorSettingsDialog(FramelessDialog):
         "timer_text_dark": "Timer tekst",
         "timer_btn_dark": "Timer knop",
     }
+    GROUPS = [
+        ("Kalender dagen", ["bg_today_dark", "bg_vacation_dark", "bg_holiday_dark", "bg_school_dark", "bg_weekend_dark", "bg_default_dark", "empty_bg_dark"]),
+        ("Dagnummering", ["daynum_today_dark", "daynum_holiday_dark", "daynum_vacation_dark", "daynum_school_dark", "daynum_weekend_dark", "daynum_default_dark"]),
+        ("Weekoverzicht en uren", ["weeknum_bg_dark", "weeknum_fg_dark", "weektotal_bg_dark", "weektotal_fg_dark", "hours_fg_dark"]),
+        ("Planning en timer", ["planned_work_bg_dark", "planned_free_bg_dark", "timer_bg_dark", "timer_text_dark", "timer_btn_dark"]),
+    ]
 
     def __init__(
         self,
@@ -1834,12 +3125,18 @@ class ColorSettingsDialog(FramelessDialog):
         super().__init__(parent)
         self.setWindowTitle("Kleuren kalender")
         self.setModal(True)
-        self.resize(700, 820)
-        self.colors = dict(colors)
+        self.resize(760, 860)
+        self.colors = dict(PLANNED_COLOR_DEFAULTS)
+        self.colors.update(dict(colors or {}))
         self.extra_info_options = [o for o in normalize_extra_info_options(extra_info_options) if o.casefold() != "optioneel"]
         self.extra_info_colors = dict(extra_info_colors or {})
         self.preview_buttons: dict[str, QPushButton] = {}
         self.preview_extra_buttons: dict[str, QPushButton] = {}
+        self.preview_bg_targets: dict[str, list[QWidget]] = {}
+        self.preview_fg_targets: dict[str, list[QWidget]] = {}
+        self.preview_timer_panel: QFrame | None = None
+        self.preview_timer_text: QLabel | None = None
+        self.preview_timer_btn: QPushButton | None = None
         for opt in self.extra_info_options:
             if opt not in self.extra_info_colors:
                 self.extra_info_colors[opt] = default_extra_info_color(opt)
@@ -1847,29 +3144,35 @@ class ColorSettingsDialog(FramelessDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(8)
-        grid_box = QGroupBox("Kies kleuren")
-        grid = QGridLayout(grid_box)
+        color_content = QWidget()
+        color_content.setObjectName("colorContent")
+        color_content_lay = QVBoxLayout(color_content)
+        color_content_lay.setContentsMargins(0, 0, 0, 0)
+        color_content_lay.setSpacing(8)
+        for title, keys in self.GROUPS:
+            color_content_lay.addWidget(self._build_color_group(title, keys))
+        color_content_lay.addWidget(self._build_extra_group())
+        color_content_lay.addStretch(1)
 
-        row = 0
-        for key, label in self.LABELS.items():
-            grid.addWidget(QLabel(label), row, 0)
-            btn = QPushButton("Kies kleur")
-            btn.clicked.connect(lambda _, k=key: self.pick_color(k))
-            self.preview_buttons[key] = btn
-            grid.addWidget(btn, row, 1)
-            row += 1
+        color_scroll = QScrollArea()
+        color_scroll.setObjectName("colorScroll")
+        color_scroll.setWidgetResizable(True)
+        color_scroll.setWidget(color_content)
+        color_scroll.setMinimumHeight(440)
+        color_scroll.viewport().setObjectName("colorScrollViewport")
+        color_scroll.setStyleSheet(
+            """
+            QScrollArea#colorScroll {
+                background: #263141;
+                border: 1px solid #3b4759;
+                border-radius: 10px;
+            }
+            QWidget#colorScrollViewport { background: #263141; }
+            QWidget#colorContent { background: #263141; }
+            """
+        )
 
-        extra_box = QGroupBox("Aanvullende info kleuren (override planning)")
-        extra_grid = QGridLayout(extra_box)
-        extra_row = 0
-        for opt in self.extra_info_options:
-            extra_grid.addWidget(QLabel(opt), extra_row, 0)
-            btn = QPushButton("Kies kleur")
-            btn.clicked.connect(lambda _, o=opt: self.pick_extra_color(o))
-            self.preview_extra_buttons[opt] = btn
-            extra_grid.addWidget(btn, extra_row, 1)
-            extra_row += 1
-
+        preview_box = self._build_live_preview()
         self._refresh_previews()
 
         btn_reset = QPushButton("Reset standaard")
@@ -1885,13 +3188,167 @@ class ColorSettingsDialog(FramelessDialog):
         row_btn.addWidget(btn_cancel)
         row_btn.addWidget(btn_ok)
 
-        root.addWidget(grid_box)
-        root.addWidget(extra_box)
+        root.addWidget(preview_box)
+        root.addWidget(color_scroll, 1)
         root.addLayout(row_btn)
+
+    def _add_preview_target(self, widget: QWidget, bg_key: str | None = None, fg_key: str | None = None):
+        if bg_key:
+            self.preview_bg_targets.setdefault(bg_key, []).append(widget)
+        if fg_key:
+            self.preview_fg_targets.setdefault(fg_key, []).append(widget)
+
+    def _build_live_preview(self) -> QGroupBox:
+        box = QGroupBox("Live voorbeeld")
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+
+        wk = QLabel("wk09")
+        wk.setAlignment(Qt.AlignCenter)
+        wk.setMinimumSize(62, 42)
+        self._add_preview_target(wk, "weeknum_bg_dark", "weeknum_fg_dark")
+        grid.addWidget(wk, 0, 0)
+
+        c_default = QLabel("13\n08:00")
+        c_default.setAlignment(Qt.AlignCenter)
+        c_default.setMinimumSize(74, 52)
+        self._add_preview_target(c_default, "bg_default_dark", "daynum_default_dark")
+        grid.addWidget(c_default, 0, 1)
+
+        c_today = QLabel("NU\n07:30")
+        c_today.setAlignment(Qt.AlignCenter)
+        c_today.setMinimumSize(74, 52)
+        self._add_preview_target(c_today, "bg_today_dark", "daynum_today_dark")
+        grid.addWidget(c_today, 0, 2)
+
+        c_vac = QLabel("15\nVrij")
+        c_vac.setAlignment(Qt.AlignCenter)
+        c_vac.setMinimumSize(74, 52)
+        self._add_preview_target(c_vac, "bg_vacation_dark", "daynum_vacation_dark")
+        grid.addWidget(c_vac, 0, 3)
+
+        c_holiday = QLabel("16\nFeest")
+        c_holiday.setAlignment(Qt.AlignCenter)
+        c_holiday.setMinimumSize(74, 52)
+        self._add_preview_target(c_holiday, "bg_holiday_dark", "daynum_holiday_dark")
+        grid.addWidget(c_holiday, 0, 4)
+
+        c_school = QLabel("17\nSchool")
+        c_school.setAlignment(Qt.AlignCenter)
+        c_school.setMinimumSize(74, 52)
+        self._add_preview_target(c_school, "bg_school_dark", "daynum_school_dark")
+        grid.addWidget(c_school, 0, 5)
+
+        c_weekend = QLabel("ZA\n00:00")
+        c_weekend.setAlignment(Qt.AlignCenter)
+        c_weekend.setMinimumSize(74, 52)
+        self._add_preview_target(c_weekend, "bg_weekend_dark", "daynum_weekend_dark")
+        grid.addWidget(c_weekend, 0, 6)
+
+        c_empty = QLabel("")
+        c_empty.setAlignment(Qt.AlignCenter)
+        c_empty.setMinimumSize(74, 52)
+        self._add_preview_target(c_empty, "empty_bg_dark")
+        grid.addWidget(c_empty, 0, 7)
+
+        planned_work = QLabel("Planning werk 08:00")
+        planned_work.setAlignment(Qt.AlignCenter)
+        planned_work.setMinimumHeight(34)
+        self._add_preview_target(planned_work, "planned_work_bg_dark", "hours_fg_dark")
+        grid.addWidget(planned_work, 1, 1, 1, 3)
+
+        planned_free = QLabel("Planning vrij 08:00")
+        planned_free.setAlignment(Qt.AlignCenter)
+        planned_free.setMinimumHeight(34)
+        self._add_preview_target(planned_free, "planned_free_bg_dark", "hours_fg_dark")
+        grid.addWidget(planned_free, 1, 4, 1, 3)
+
+        total = QLabel("38:00")
+        total.setAlignment(Qt.AlignCenter)
+        total.setMinimumSize(74, 34)
+        self._add_preview_target(total, "weektotal_bg_dark", "weektotal_fg_dark")
+        grid.addWidget(total, 1, 7)
+
+        self.preview_timer_panel = QFrame()
+        timer_lay = QHBoxLayout(self.preview_timer_panel)
+        timer_lay.setContentsMargins(6, 4, 6, 4)
+        timer_lay.setSpacing(8)
+        self.preview_timer_text = QLabel("T: 01:23:45  P: 00:04:00  C: 00:12:10")
+        self.preview_timer_btn = QPushButton("Open")
+        self.preview_timer_btn.setEnabled(False)
+        timer_lay.addWidget(self.preview_timer_text, 1)
+        timer_lay.addWidget(self.preview_timer_btn)
+        grid.addWidget(self.preview_timer_panel, 2, 0, 1, 8)
+
+        return box
+
+    def _refresh_live_preview(self):
+        for key, widgets in self.preview_bg_targets.items():
+            bg = self.colors.get(key, PLANNED_COLOR_DEFAULTS.get(key, "#263141"))
+            for w in widgets:
+                fg = self.colors.get("hours_fg_dark", "#e6edf7")
+                if key.startswith("daynum_"):
+                    fg = self.colors.get(key, fg)
+                style = (
+                    f"background:{bg}; color:{fg}; border:1px solid #344156; "
+                    "border-radius:6px; padding:2px 4px;"
+                )
+                w.setStyleSheet(style)
+
+        for key, widgets in self.preview_fg_targets.items():
+            fg = self.colors.get(key, PLANNED_COLOR_DEFAULTS.get(key, "#e6edf7"))
+            for w in widgets:
+                cur = w.styleSheet()
+                if "color:" in cur:
+                    cur = re.sub(r"color\\s*:\\s*[^;]+;", f"color:{fg};", cur)
+                    w.setStyleSheet(cur)
+                else:
+                    w.setStyleSheet(cur + f" color:{fg};")
+
+        if self.preview_timer_panel and self.preview_timer_text and self.preview_timer_btn:
+            tbg = self.colors.get("timer_bg_dark", PLANNED_COLOR_DEFAULTS["timer_bg_dark"])
+            tfg = self.colors.get("timer_text_dark", PLANNED_COLOR_DEFAULTS["timer_text_dark"])
+            tbtn = self.colors.get("timer_btn_dark", PLANNED_COLOR_DEFAULTS["timer_btn_dark"])
+            self.preview_timer_panel.setStyleSheet(
+                f"QFrame {{ background:{tbg}; border:1px solid #344156; border-radius:8px; }}"
+            )
+            self.preview_timer_text.setStyleSheet(f"color:{tfg}; font: 9pt 'Consolas';")
+            self.preview_timer_btn.setStyleSheet(
+                f"QPushButton {{ background:{tbtn}; color:#ffffff; border:1px solid #344156; border-radius:6px; padding:4px 10px; }}"
+            )
+
+    def _build_color_group(self, title: str, keys: list[str]) -> QGroupBox:
+        box = QGroupBox(title)
+        grid = QGridLayout(box)
+        row = 0
+        for key in keys:
+            if key not in self.LABELS:
+                continue
+            grid.addWidget(QLabel(self.LABELS[key]), row, 0)
+            btn = QPushButton("Kies kleur")
+            btn.clicked.connect(lambda _, k=key: self.pick_color(k))
+            self.preview_buttons[key] = btn
+            grid.addWidget(btn, row, 1)
+            row += 1
+        return box
+
+    def _build_extra_group(self) -> QGroupBox:
+        box = QGroupBox("Aanvullende info kleuren")
+        grid = QGridLayout(box)
+        row = 0
+        for opt in self.extra_info_options:
+            grid.addWidget(QLabel(opt), row, 0)
+            btn = QPushButton("Kies kleur")
+            btn.clicked.connect(lambda _, o=opt: self.pick_extra_color(o))
+            self.preview_extra_buttons[opt] = btn
+            grid.addWidget(btn, row, 1)
+            row += 1
+        return box
 
     def _refresh_previews(self):
         for key, btn in self.preview_buttons.items():
-            clr = self.colors.get(key, COLOR_DEFAULTS[key])
+            clr = self.colors.get(key, PLANNED_COLOR_DEFAULTS[key])
             btn.setText(clr.upper())
             btn.setStyleSheet(
                 f"QPushButton {{ background:{clr}; color:#ffffff; border:1px solid #334155; border-radius:6px; padding:4px 8px; }}"
@@ -1902,9 +3359,10 @@ class ColorSettingsDialog(FramelessDialog):
             btn.setStyleSheet(
                 f"QPushButton {{ background:{clr}; color:#ffffff; border:1px solid #334155; border-radius:6px; padding:4px 8px; }}"
             )
+        self._refresh_live_preview()
 
     def pick_color(self, key: str):
-        current = QColor(self.colors.get(key, COLOR_DEFAULTS[key]))
+        current = QColor(self.colors.get(key, PLANNED_COLOR_DEFAULTS[key]))
         c = QColorDialog.getColor(current, self, f"Kies kleur: {self.LABELS.get(key, key)}")
         if c.isValid():
             self.colors[key] = c.name()
@@ -1918,38 +3376,49 @@ class ColorSettingsDialog(FramelessDialog):
             self._refresh_previews()
 
     def reset_defaults(self):
-        self.colors = dict(COLOR_DEFAULTS)
+        self.colors = dict(PLANNED_COLOR_DEFAULTS)
         self.extra_info_colors = {opt: default_extra_info_color(opt) for opt in self.extra_info_options}
         self._refresh_previews()
 
 
 class TimerSettingsDialog(FramelessDialog):
-    def __init__(self, parent: QWidget, idle_threshold_sec: int):
+    def __init__(self, parent: QWidget, idle_threshold_sec: int, include_lockscreen_idle: bool, include_sleep_idle: bool):
         super().__init__(parent)
-        self.setWindowTitle("Timer idle instellingen")
+        self.setWindowTitle("Timer idle/pauze instellingen")
         self.setModal(True)
-        self.resize(340, 120)
+        self.resize(460, 250)
         self.idle_threshold_sec = max(15, min(3600, int(idle_threshold_sec or 60)))
+        self.include_lockscreen_idle = bool(include_lockscreen_idle)
+        self.include_sleep_idle = bool(include_sleep_idle)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(6)
 
-        total = self.idle_threshold_sec
-        mins = total // 60
-        secs = total % 60
+        mins = max(1, round(self.idle_threshold_sec / 60))
+        self.lbl_minutes = QLabel("")
+        root.addWidget(self.lbl_minutes)
+        self.slider_min = QSlider(Qt.Horizontal)
+        self.slider_min.setRange(1, 60)
+        self.slider_min.setValue(mins)
+        self.slider_min.valueChanged.connect(self._update_minutes_label)
+        root.addWidget(self.slider_min)
+        self._update_minutes_label(self.slider_min.value())
 
-        form = QFormLayout()
-        form.setHorizontalSpacing(12)
-        self.spin_min = QSpinBox()
-        self.spin_min.setRange(0, 60)
-        self.spin_min.setValue(mins)
-        self.spin_sec = QSpinBox()
-        self.spin_sec.setRange(0, 59)
-        self.spin_sec.setValue(secs)
-        form.addRow("Minuten", self.spin_min)
-        form.addRow("Seconden", self.spin_sec)
-        root.addLayout(form)
+        self.chk_lockscreen = QCheckBox("Lockscreen meetellen als pauze-kandidaat")
+        self.chk_lockscreen.setChecked(self.include_lockscreen_idle)
+        root.addWidget(self.chk_lockscreen)
+
+        self.chk_sleep = QCheckBox("Sleep/hibernate meetellen als pauze-kandidaat")
+        self.chk_sleep.setChecked(self.include_sleep_idle)
+        root.addWidget(self.chk_sleep)
+
+        hint = QLabel(
+            "Advies: lockscreen aan laten voor pauzeregistratie, sleep/hibernate meestal uit om systeemevents te negeren."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#b8c7d8;")
+        root.addWidget(hint)
 
         btn_cancel = QPushButton("Annuleren")
         btn_save = QPushButton("Opslaan")
@@ -1962,18 +3431,23 @@ class TimerSettingsDialog(FramelessDialog):
         row.addWidget(btn_save)
         root.addLayout(row)
 
+    def _update_minutes_label(self, value: int):
+        self.lbl_minutes.setText(f"Pauze-drempel (idle): {int(value)} minuut/minuten")
+
     def _save(self):
-        total = int(self.spin_min.value()) * 60 + int(self.spin_sec.value())
-        self.idle_threshold_sec = max(15, min(3600, total))
+        total = int(self.slider_min.value()) * 60
+        self.idle_threshold_sec = max(60, min(3600, total))
+        self.include_lockscreen_idle = bool(self.chk_lockscreen.isChecked())
+        self.include_sleep_idle = bool(self.chk_sleep.isChecked())
         self.accept()
 
 
 class GlassSettingsDialog(FramelessDialog):
     def __init__(self, parent: QWidget, inactive_glass_opacity: float):
         super().__init__(parent)
-        self.setWindowTitle("Glassmorphism")
+        self.setWindowTitle("Doorzichtigheid")
         self.setModal(True)
-        self.resize(390, 150)
+        self.resize(430, 180)
         try:
             op = float(inactive_glass_opacity)
         except Exception:
@@ -1984,14 +3458,14 @@ class GlassSettingsDialog(FramelessDialog):
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(6)
 
-        form = QFormLayout()
-        form.setHorizontalSpacing(12)
-        self.spin_glass = QSpinBox()
-        self.spin_glass.setRange(int(GLASS_OPACITY_MIN * 100), int(GLASS_OPACITY_MAX * 100))
-        self.spin_glass.setSuffix("%")
-        self.spin_glass.setValue(int(round(self.inactive_glass_opacity * 100)))
-        form.addRow("Transparantie bij focusverlies", self.spin_glass)
-        root.addLayout(form)
+        self.lbl_glass = QLabel("")
+        root.addWidget(self.lbl_glass)
+        self.slider_glass = QSlider(Qt.Horizontal)
+        self.slider_glass.setRange(int(GLASS_OPACITY_MIN * 100), int(GLASS_OPACITY_MAX * 100))
+        self.slider_glass.setValue(int(round(self.inactive_glass_opacity * 100)))
+        self.slider_glass.valueChanged.connect(self._update_glass_label)
+        root.addWidget(self.slider_glass)
+        self._update_glass_label(self.slider_glass.value())
 
         hint = QLabel(
             f"Wordt toegepast als de app niet actief is (Alt-Tab naar andere app).\n"
@@ -2010,8 +3484,207 @@ class GlassSettingsDialog(FramelessDialog):
         row.addWidget(btn_save)
         root.addLayout(row)
 
+    def _update_glass_label(self, value: int):
+        self.lbl_glass.setText(f"Doorzichtigheid bij focusverlies: {int(value)}%")
+
     def _save(self):
-        self.inactive_glass_opacity = max(GLASS_OPACITY_MIN, min(GLASS_OPACITY_MAX, float(self.spin_glass.value()) / 100.0))
+        self.inactive_glass_opacity = max(GLASS_OPACITY_MIN, min(GLASS_OPACITY_MAX, float(self.slider_glass.value()) / 100.0))
+        self.accept()
+
+
+class BulkPlanningDialog(FramelessDialog):
+    """Bulk planner voor Werk/Vrij over een datumrange met weekdagfilter."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        year: int,
+        extra_info_options: list[str] | None = None,
+        allow_tvt: bool = True,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        weekday_limits: list[int] | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk plannen")
+        self.setModal(True)
+        self.resize(760, 520)
+        today = date.today()
+        start_default = date(year, today.month, 1) if today.year == year else date(year, 1, 1)
+        end_default = date(year, today.month, calendar.monthrange(year, today.month)[1]) if today.year == year else date(year, 12, 31)
+
+        self.result_data: dict[str, object] | None = None
+        self.weekday_limits = list(weekday_limits or [8 * 60] * 7)
+        if len(self.weekday_limits) < 7:
+            self.weekday_limits.extend([8 * 60] * (7 - len(self.weekday_limits)))
+        self.weekday_limits = [max(0, int(v)) for v in self.weekday_limits[:7]]
+        start_default = start_date or start_default
+        end_default = end_date or end_default
+        if start_default > end_default:
+            start_default, end_default = end_default, start_default
+        self.e_from = QDateEdit()
+        self.e_from.setDisplayFormat("dd-MM-yyyy")
+        self.e_from.setCalendarPopup(True)
+        self.e_from.setDate(QDate(start_default.year, start_default.month, start_default.day))
+        self.e_to = QDateEdit()
+        self.e_to.setDisplayFormat("dd-MM-yyyy")
+        self.e_to.setCalendarPopup(True)
+        self.e_to.setDate(QDate(end_default.year, end_default.month, end_default.day))
+        self.chk_skip_weekend = QCheckBox("Weekend overslaan")
+        self.chk_skip_weekend.setChecked(True)
+        self.chk_skip_holiday = QCheckBox("Feestdagen overslaan")
+        self.chk_skip_holiday.setChecked(True)
+        self.extra_options = ["(ongewijzigd)", "(leegmaken)"]
+        opts = normalize_extra_info_options(extra_info_options)
+        if not allow_tvt:
+            opts = [o for o in opts if o.strip().casefold() != "tijd voor tijd"]
+        self.extra_options.extend(opts)
+
+        self.day_rows: list[dict[str, object]] = []
+        weekday_box = QGroupBox("Per dag invullen (MA t/m ZO)")
+        weekday_grid = QGridLayout(weekday_box)
+        weekday_grid.setContentsMargins(8, 8, 8, 8)
+        weekday_grid.setHorizontalSpacing(8)
+        weekday_grid.setVerticalSpacing(6)
+        weekday_grid.addWidget(QLabel("Dag"), 0, 0)
+        weekday_grid.addWidget(QLabel("Actief"), 0, 1)
+        weekday_grid.addWidget(QLabel("Werk"), 0, 2)
+        weekday_grid.addWidget(QLabel("Vrij"), 0, 3)
+        weekday_grid.addWidget(QLabel("Aanvullende info"), 0, 4)
+        weekday_grid.addWidget(QLabel("Vrij-toelichting"), 0, 5)
+        for i, wd in enumerate(WEEKDAYS):
+            row = i + 1
+            lbl = QLabel(wd)
+            chk = QCheckBox()
+            chk.setChecked(i < 5)
+            e_w = QLineEdit("08:00" if i < 5 else "00:00")
+            e_v = QLineEdit("00:00")
+            force_hhmm_line_edit(e_w)
+            force_hhmm_line_edit(e_v)
+            cmb = QComboBox()
+            for item in self.extra_options:
+                cmb.addItem(item)
+            cmb.setCurrentText("(ongewijzigd)")
+            e_reason = QLineEdit("Vakantie {weekdag}" if i < 5 else "")
+            e_reason.setPlaceholderText("bijv. Vakantie {datum}")
+            limit_txt = minutes_to_hhmm(self.weekday_limits[i])
+            e_w.setToolTip(f"Dagmax {wd}: {limit_txt}")
+            e_v.setToolTip(f"Dagmax {wd}: {limit_txt}")
+            e_w.editingFinished.connect(lambda idx=i: self._rebalance_day_row(idx, "w"))
+            e_v.editingFinished.connect(lambda idx=i: self._rebalance_day_row(idx, "v"))
+            weekday_grid.addWidget(lbl, row, 0)
+            weekday_grid.addWidget(chk, row, 1)
+            weekday_grid.addWidget(e_w, row, 2)
+            weekday_grid.addWidget(e_v, row, 3)
+            weekday_grid.addWidget(cmb, row, 4)
+            weekday_grid.addWidget(e_reason, row, 5)
+            self.day_rows.append({"check": chk, "work": e_w, "free": e_v, "extra": cmb, "reason": e_reason})
+            self._rebalance_day_row(i, None)
+
+        form = QFormLayout()
+        form.addRow("Van", self.e_from)
+        form.addRow("Tot en met", self.e_to)
+        form.addRow("", self.chk_skip_weekend)
+        form.addRow("", self.chk_skip_holiday)
+
+        hint = QLabel("Tokens in toelichting: {datum} en {weekdag}. Dagmax uit werkpatroon blijft leidend.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#b8c7d8;")
+
+        btn_cancel = QPushButton("Annuleren")
+        btn_apply = QPushButton("Toepassen")
+        btn_cancel.clicked.connect(self.reject)
+        btn_apply.clicked.connect(self._save)
+        row_btn = QHBoxLayout()
+        row_btn.addStretch(1)
+        row_btn.addWidget(btn_cancel)
+        row_btn.addWidget(btn_apply)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
+        root.addLayout(form)
+        root.addWidget(weekday_box, 1)
+        root.addWidget(hint)
+        root.addLayout(row_btn)
+
+    def _rebalance_day_row(self, weekday_idx: int, changed: str | None):
+        if weekday_idx < 0 or weekday_idx >= len(self.day_rows):
+            return
+        cfg = self.day_rows[weekday_idx]
+        e_w = cfg["work"]
+        e_v = cfg["free"]
+        day_limit = self.weekday_limits[weekday_idx]
+        w_min = min(hhmm_to_minutes(normalize_hhmm(e_w.text())), day_limit)
+        v_min = min(hhmm_to_minutes(normalize_hhmm(e_v.text())), day_limit)
+        total = w_min + v_min
+        if total > day_limit:
+            overflow = total - day_limit
+            if changed == "w":
+                reduce_v = min(v_min, overflow)
+                v_min -= reduce_v
+                overflow -= reduce_v
+                if overflow > 0:
+                    w_min = max(0, w_min - overflow)
+            elif changed == "v":
+                reduce_w = min(w_min, overflow)
+                w_min -= reduce_w
+                overflow -= reduce_w
+                if overflow > 0:
+                    v_min = max(0, v_min - overflow)
+            else:
+                reduce_v = min(v_min, overflow)
+                v_min -= reduce_v
+                overflow -= reduce_v
+                if overflow > 0:
+                    w_min = max(0, w_min - overflow)
+        e_w.setText(minutes_to_hhmm(w_min))
+        e_v.setText(minutes_to_hhmm(v_min))
+
+    def _save(self):
+        q_from = self.e_from.date()
+        q_to = self.e_to.date()
+        d_from = date(q_from.year(), q_from.month(), q_from.day())
+        d_to = date(q_to.year(), q_to.month(), q_to.day())
+        if d_from > d_to:
+            d_from, d_to = d_to, d_from
+        rows_cfg: list[dict[str, object]] = []
+        active_any = False
+        for i, cfg in enumerate(self.day_rows):
+            chk = cfg["check"]
+            e_w = cfg["work"]
+            e_v = cfg["free"]
+            cmb = cfg["extra"]
+            e_reason = cfg["reason"]
+            is_active = bool(chk.isChecked())
+            w_h = normalize_hhmm(e_w.text(), "00:00")
+            v_h = normalize_hhmm(e_v.text(), "00:00")
+            if not parse_hhmm_strict(w_h) or not parse_hhmm_strict(v_h):
+                QMessageBox.warning(self, "Fout", f"Ongeldige werk/vrij uren bij {WEEKDAYS[i]}. Gebruik hh:mm.")
+                return
+            if is_active:
+                active_any = True
+            rows_cfg.append(
+                {
+                    "weekday": i,
+                    "active": is_active,
+                    "work_hours": w_h,
+                    "free_hours": v_h,
+                    "extra_mode": cmb.currentText().strip(),
+                    "reason_tpl": e_reason.text().strip(),
+                }
+            )
+
+        if not active_any:
+            QMessageBox.warning(self, "Fout", "Selecteer minimaal één weekdag.")
+            return
+        self.result_data = {
+            "start": d_from,
+            "end": d_to,
+            "skip_weekend": bool(self.chk_skip_weekend.isChecked()),
+            "skip_holiday": bool(self.chk_skip_holiday.isChecked()),
+            "rows_cfg": rows_cfg,
+        }
         self.accept()
 
 
@@ -2048,6 +3721,134 @@ class SchoolRegionDialog(FramelessDialog):
 
     def _save(self):
         self.region = self.cb_region.currentText().strip().casefold()
+        self.accept()
+
+
+class ContractBudgetDialog(FramelessDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        employment_pct: float,
+        fulltime_week_min: int,
+        contract_year_min: int,
+        vacation_stat_min: int,
+        vacation_extra_min: int,
+        carry_hours_prev_min: int,
+        carry_vac_prev_min: int,
+        workdays_mask: list[bool],
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Contract en vakantiebudget")
+        self.setModal(True)
+        self.resize(540, 400)
+        self.employment_pct = float(employment_pct)
+        self.fulltime_week = format_hours_int(fulltime_week_min)
+        self.contract_year = format_hours_int(contract_year_min)
+        self.vacation_stat = format_hours_int(vacation_stat_min)
+        self.vacation_extra = format_hours_int(vacation_extra_min)
+        self.carry_hours_prev = format_hours_int(carry_hours_prev_min, signed=True)
+        self.carry_vac_prev = format_hours_int(carry_vac_prev_min, signed=True)
+        self.workdays_mask = [bool(x) for x in (workdays_mask or [True, True, True, True, True, False, False])][:7]
+        while len(self.workdays_mask) < 7:
+            self.workdays_mask.append(False)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
+        form = QFormLayout()
+        self.e_pct = QLineEdit(f"{int(round(self.employment_pct))}")
+        self.e_fulltime = QLineEdit(self.fulltime_week)
+        self.e_contract_year = QLineEdit(self.contract_year)
+        self.e_stat = QLineEdit(self.vacation_stat)
+        self.e_extra = QLineEdit(self.vacation_extra)
+        self.e_carry_hours = QLineEdit(self.carry_hours_prev)
+        self.e_carry_vac = QLineEdit(self.carry_vac_prev)
+        self.e_pct.setMaxLength(3)
+        self.e_pct.setFixedWidth(70)
+        for e in (self.e_fulltime, self.e_contract_year, self.e_stat, self.e_extra):
+            e.setPlaceholderText("uren")
+            e.setMaxLength(4)
+            e.setFixedWidth(90)
+        self.e_carry_hours.setPlaceholderText("+/-uren")
+        self.e_carry_vac.setPlaceholderText("+/-uren")
+        self.e_carry_hours.setMaxLength(5)
+        self.e_carry_vac.setMaxLength(5)
+        self.e_carry_hours.setFixedWidth(90)
+        self.e_carry_vac.setFixedWidth(90)
+        form.addRow("Omvang dienstbetrekking (%)", self.e_pct)
+        form.addRow("Fulltime uren/week (100%)", self.e_fulltime)
+        form.addRow("Contracturen jaar", self.e_contract_year)
+        form.addRow("Wettelijke vakantie (jaar)", self.e_stat)
+        form.addRow("Bovenwettelijke vakantie (jaar)", self.e_extra)
+        form.addRow("Meer/minder uren vorig jaar", self.e_carry_hours)
+        form.addRow("Vakantie over/tekort vorig jaar", self.e_carry_vac)
+        root.addLayout(form)
+
+        days_box = QGroupBox("Werkdagen per week")
+        days_grid = QGridLayout(days_box)
+        self.day_checks: list[QCheckBox] = []
+        for i, dn in enumerate(WEEKDAYS):
+            cb = QCheckBox(dn)
+            cb.setChecked(bool(self.workdays_mask[i]))
+            self.day_checks.append(cb)
+            days_grid.addWidget(cb, i // 4, i % 4)
+        root.addWidget(days_box)
+
+        btn_defaults = QPushButton("Herstel 100%")
+        btn_defaults.clicked.connect(self._reset_100_defaults)
+        btn_cancel = QPushButton("Annuleren")
+        btn_save = QPushButton("Opslaan")
+        btn_cancel.clicked.connect(self.reject)
+        btn_save.clicked.connect(self._save)
+        row = QHBoxLayout()
+        row.addWidget(btn_defaults)
+        row.addStretch(1)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_save)
+        root.addLayout(row)
+
+    def _reset_100_defaults(self):
+        # Herstelt alleen de basisdefaults; carry-over velden blijven bewust intact.
+        # Reden: carry-over vertegenwoordigt historische correcties en mag niet per ongeluk verdwijnen.
+        # Deze knop is bedoeld als snelle reset van de "normale" contractinstelling voor dit jaar.
+        self.e_pct.setText("100")
+        self.e_fulltime.setText("38")
+        self.e_contract_year.setText("1938")
+        self.e_stat.setText("152")
+        self.e_extra.setText("56")
+        for i, cb in enumerate(self.day_checks):
+            cb.setChecked(i < 5)
+
+    def _save(self):
+        try:
+            pct = float(self.e_pct.text().strip().replace(",", "."))
+        except Exception:
+            QMessageBox.warning(self, "Fout", "Ongeldige % voor dienstbetrekking.")
+            return
+        if pct < 0 or pct > 200:
+            QMessageBox.warning(self, "Fout", "Dienstbetrekking % moet tussen 0 en 200 liggen.")
+            return
+        fw = parse_duration_hhmm(self.e_fulltime.text(), default=-1)
+        cy = parse_duration_hhmm(self.e_contract_year.text(), default=-1)
+        s = parse_duration_hhmm(self.e_stat.text(), default=-1)
+        x = parse_duration_hhmm(self.e_extra.text(), default=-1)
+        ch = parse_duration_hhmm(self.e_carry_hours.text(), default=0, allow_signed=True)
+        cv = parse_duration_hhmm(self.e_carry_vac.text(), default=0, allow_signed=True)
+        if fw < 0 or cy < 0 or s < 0 or x < 0:
+            QMessageBox.warning(self, "Fout", "Gebruik hele uren (of hh:mm) voor uren.")
+            return
+        mask = [cb.isChecked() for cb in self.day_checks]
+        if sum(1 for x_on in mask if x_on) == 0:
+            QMessageBox.warning(self, "Fout", "Selecteer minimaal 1 werkdag.")
+            return
+        self.employment_pct = pct
+        self.fulltime_week = format_duration_hhmm(fw)
+        self.contract_year = format_duration_hhmm(cy)
+        self.vacation_stat = format_duration_hhmm(s)
+        self.vacation_extra = format_duration_hhmm(x)
+        self.carry_hours_prev = format_duration_hhmm(ch, signed=True)
+        self.carry_vac_prev = format_duration_hhmm(cv, signed=True)
+        self.workdays_mask = mask
         self.accept()
 
 
@@ -2164,23 +3965,95 @@ class ExtraInfoSettingsDialog(FramelessDialog):
         self.accept()
 
 
+# ============================================================================
+# TIMER SUBSYSTEEM
+# Dit blok bevat de live-metering en de timer-UI.
+# De timer tikt per seconde, detecteert idle/call-activiteit en synchroniseert
+# periodiek naar opslag zonder dat de gebruiker handmatig hoeft op te slaan.
+# ============================================================================
 class TimerPanel(QFrame):
-    """Timer met oud `Log tijd.py` gedrag (auto work/idle/call detectie)."""
+    """Timer met oud `Log tijd.py` gedrag (auto work/idle/call detectie).
+
+    Deze component draait op een korte tick en schrijft periodiek weg naar
+    opslag. De UI is compact gehouden zodat het venster klein kan blijven,
+    terwijl de kernmeters toch live zichtbaar zijn.
+    """
 
     height_changed = Signal(int)
 
     DEFAULT_IDLE_THRESHOLD_SEC = 60
+    PAUSE_CONFIRM_TIMEOUT_SEC = 45
+    CALL_PROBE_INTERVAL_SEC = 2.0
+    CALL_HOLD_SECONDS = 8.0
+
+    CALL_APP_PROCESSES = {
+        "teams",
+        "ms-teams",
+        "msteams",
+        "zoom",
+        "slack",
+        "webex",
+    }
+    BROWSER_PROCESSES = {
+        "chrome",
+        "msedge",
+        "firefox",
+        "brave",
+        "opera",
+    }
+    CALL_TITLE_KEYWORDS = (
+        "teams meeting",
+        "microsoft teams",
+        "zoom meeting",
+        "google meet",
+        "meet.google.com",
+        "webex",
+        "vergadering",
+        "in gesprek",
+        "in call",
+        "on a call",
+        "meeting",
+    )
 
     class LASTINPUTINFO(ctypes.Structure):
         _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
-    def __init__(self, store: ExcelStore, on_refresh, on_toggle_full, on_drag_move, idle_threshold_sec: int = DEFAULT_IDLE_THRESHOLD_SEC):
+    @staticmethod
+    def _make_calendar_icon() -> QIcon:
+        pm = QPixmap(18, 18)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        body = QRect(1, 2, 16, 15)
+        p.setBrush(QColor("#2f4f75"))
+        p.setPen(QPen(QColor("#8fb3da"), 1))
+        p.drawRoundedRect(body, 3, 3)
+        header = QRect(1, 2, 16, 5)
+        p.setBrush(QColor("#4e7fba"))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(header, 3, 3)
+        p.setBrush(QColor("#e8f3ff"))
+        p.setPen(Qt.NoPen)
+        p.drawRect(4, 1, 2, 3)
+        p.drawRect(12, 1, 2, 3)
+        p.setBrush(QColor("#dce9f7"))
+        p.drawRect(4, 9, 3, 2)
+        p.drawRect(8, 9, 3, 2)
+        p.drawRect(12, 9, 2, 2)
+        p.drawRect(4, 12, 3, 2)
+        p.drawRect(8, 12, 3, 2)
+        p.drawRect(12, 12, 2, 2)
+        p.end()
+        return QIcon(pm)
+
+    def __init__(self, store: StorageBackend, on_refresh, on_toggle_full, on_drag_move, idle_threshold_sec: int = DEFAULT_IDLE_THRESHOLD_SEC):
         super().__init__()
         self.store = store
         self.on_refresh = on_refresh
         self.on_toggle_full = on_toggle_full
         self.on_drag_move = on_drag_move
         self.running = True
+        self.tracking_enabled = True
         self.work_seconds = 0
         self.idle_seconds = 0
         self.call_seconds = 0
@@ -2197,6 +4070,16 @@ class TimerPanel(QFrame):
         self.min_inactive_glass_opacity = GLASS_OPACITY_MIN
         self.max_inactive_glass_opacity = GLASS_OPACITY_MAX
         self._colors_cache: dict[str, str] = {}
+        self._call_detect_cache = False
+        self._call_hold_until = 0.0
+        self._call_last_probe = 0.0
+        self._idle_episode_active = False
+        self._idle_episode_seconds = 0
+        self._unconfirmed_pause_seconds = 0
+        self.os_session_locked = False
+        self.os_system_sleeping = False
+        self.include_lockscreen_idle = True
+        self.include_sleep_idle = False
 
         self.setObjectName("timerPanel")
         self.setMinimumWidth(372)
@@ -2213,14 +4096,16 @@ class TimerPanel(QFrame):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
-        self.lbl_line = QLabel("T: 00:00:00  I: 00:00:00  C: 00:00:00")
+        self.lbl_line = QLabel("T: 00:00:00  P: 00:00:00  C: 00:00:00")
         self.lbl_line.setStyleSheet("font: 11pt 'Consolas'; font-weight:700;")
         self.lbl_line.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.lbl_line.setMinimumHeight(42)
         self.lbl_line.installEventFilter(self)
         row.addWidget(self.lbl_line, 1)
 
-        self.btn_open = QPushButton("📅")
+        self.btn_open = QPushButton("")
+        self.btn_open.setIcon(self._make_calendar_icon())
+        self.btn_open.setIconSize(QPixmap(18, 18).size())
         self.btn_open.setToolTip("Planner tonen/verbergen")
         self.btn_open.setFixedSize(44, 42)
         self.btn_open.setCheckable(True)
@@ -2228,11 +4113,29 @@ class TimerPanel(QFrame):
         row.addWidget(self.btn_open)
         root.addLayout(row)
 
-        self.idle_label = QLabel("⚠ IDLE binnenkort")
+        self.idle_label = QLabel("IDLE binnenkort")
         self.idle_label.setVisible(False)
         self.idle_label.setAlignment(Qt.AlignCenter)
         self.idle_label.setStyleSheet("font: 9pt 'Consolas'; font-weight:700;")
         root.addWidget(self.idle_label)
+
+        self.pause_confirm_row = QWidget(self)
+        pause_row_layout = QHBoxLayout(self.pause_confirm_row)
+        pause_row_layout.setContentsMargins(2, 0, 2, 0)
+        pause_row_layout.setSpacing(4)
+        self.pause_confirm_label = QLabel("Idle gedetecteerd. Als pauze registreren?")
+        self.pause_confirm_label.setStyleSheet("font: 8.7pt 'Segoe UI'; font-weight:600;")
+        pause_row_layout.addWidget(self.pause_confirm_label, 1)
+        self.btn_pause_yes = QPushButton("Ja")
+        self.btn_pause_no = QPushButton("Nee")
+        self.btn_pause_yes.setFixedHeight(24)
+        self.btn_pause_no.setFixedHeight(24)
+        self.btn_pause_yes.clicked.connect(self._confirm_pause_yes)
+        self.btn_pause_no.clicked.connect(self._confirm_pause_no)
+        pause_row_layout.addWidget(self.btn_pause_yes)
+        pause_row_layout.addWidget(self.btn_pause_no)
+        self.pause_confirm_row.setVisible(False)
+        root.addWidget(self.pause_confirm_row)
 
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
@@ -2240,11 +4143,28 @@ class TimerPanel(QFrame):
         self.warn_timer = QTimer(self)
         self.warn_timer.setInterval(100)
         self.warn_timer.timeout.connect(self._animate_warning)
+        self.pause_confirm_timer = QTimer(self)
+        self.pause_confirm_timer.setSingleShot(True)
+        self.pause_confirm_timer.setInterval(self.PAUSE_CONFIRM_TIMEOUT_SEC * 1000)
+        self.pause_confirm_timer.timeout.connect(self._confirm_pause_no)
 
         self.set_idle_threshold(idle_threshold_sec)
         self.load_today()
         self.update_ui()
         self.timer.start()
+
+    def set_tracking_enabled(self, enabled: bool):
+        self.tracking_enabled = bool(enabled)
+        if not self.tracking_enabled:
+            self._hide_idle_warning()
+            self._idle_episode_active = False
+            self._idle_episode_seconds = 0
+            self._confirm_pause_no()
+            self.persist()
+            self.timer.stop()
+        elif self.running and not self.timer.isActive():
+            self.timer.start()
+        self.update_ui()
 
     def eventFilter(self, obj, event):
         if obj is self.lbl_line:
@@ -2360,29 +4280,142 @@ class TimerPanel(QFrame):
         lii = self.LASTINPUTINFO()
         lii.cbSize = ctypes.sizeof(self.LASTINPUTINFO)
         if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-            ms = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+            try:
+                now64 = int(ctypes.windll.kernel32.GetTickCount64())
+                now32 = now64 & 0xFFFFFFFF
+                ms = (now32 - int(lii.dwTime)) & 0xFFFFFFFF
+            except Exception:
+                ms = int(ctypes.windll.kernel32.GetTickCount()) - int(lii.dwTime)
             return ms / 1000.0
         return 0.0
 
-    def detect_call(self) -> bool:
-        if psutil is None or gw is None:
+    @staticmethod
+    def _normalize_process_name(raw: str) -> str:
+        name = (raw or "").strip().lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        return name
+
+    @classmethod
+    def _is_likely_call_title(cls, title: str) -> bool:
+        t = (title or "").strip().casefold()
+        if not t:
             return False
+        return any(k in t for k in cls.CALL_TITLE_KEYWORDS)
+
+    def _running_process_names(self) -> set[str]:
+        if psutil is None:
+            return set()
+        names: set[str] = set()
         try:
             for proc in psutil.process_iter(["name"]):
-                name = (proc.info.get("name") or "").lower()
-                if any(x in name for x in ("teams", "chrome", "edge", "zoom", "slack")):
-                    windows = (
-                        gw.getWindowsWithTitle("Meeting")
-                        + gw.getWindowsWithTitle("Call")
-                        + gw.getWindowsWithTitle("Vergadering")
-                    )
-                    if windows:
-                        return True
+                nm = self._normalize_process_name(proc.info.get("name") or "")
+                if nm:
+                    names.add(nm)
         except Exception:
-            return False
+            return names
+        return names
+
+    def _active_audio_session_processes(self) -> set[str]:
+        if AudioUtilities is None:
+            return set()
+        active: set[str] = set()
+        try:
+            for session in AudioUtilities.GetAllSessions():
+                proc = getattr(session, "Process", None)
+                if proc is None:
+                    continue
+                try:
+                    name = self._normalize_process_name(proc.name())
+                except Exception:
+                    continue
+                if not name:
+                    continue
+                state = int(getattr(session, "State", 0))
+                # 1=Active, 2=Expired op sommige builds; active sessies tellen mee.
+                if state == 1:
+                    active.add(name)
+        except Exception:
+            return active
+        return active
+
+    def _foreground_context(self) -> tuple[str, str]:
+        title = ""
+        proc_name = ""
+        if gw is not None:
+            try:
+                w = gw.getActiveWindow()
+                if w is not None:
+                    title = str(getattr(w, "title", "") or "")
+            except Exception:
+                pass
+        if sys.platform == "win32" and psutil is not None:
+            try:
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+                if hwnd:
+                    pid = wintypes.DWORD()
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value:
+                        proc_name = self._normalize_process_name(psutil.Process(int(pid.value)).name())
+            except Exception:
+                pass
+        return title, proc_name
+
+    def _probe_call_now(self) -> bool:
+        running = self._running_process_names()
+        audio_active = self._active_audio_session_processes()
+        fg_title, fg_proc = self._foreground_context()
+        fg_has_call = self._is_likely_call_title(fg_title)
+        has_call_app = any(p in running for p in self.CALL_APP_PROCESSES)
+        has_browser = any(p in running for p in self.BROWSER_PROCESSES)
+        has_call_audio = any(p in audio_active for p in self.CALL_APP_PROCESSES)
+        has_browser_audio = any(p in audio_active for p in self.BROWSER_PROCESSES)
+
+        # Directe signalen: call-app met actieve audio of foreground-call context.
+        if has_call_audio:
+            return True
+
+        if fg_has_call:
+            if fg_proc in self.CALL_APP_PROCESSES:
+                return True
+            if fg_proc in self.BROWSER_PROCESSES and has_browser_audio:
+                return True
+            if has_call_app or has_call_audio or has_browser_audio:
+                return True
+
+        # Fallback: scan windowtitels alleen als er relevante processen/audio actief zijn.
+        if gw is not None and (has_call_app or has_browser or has_call_audio or has_browser_audio):
+            try:
+                titles = gw.getAllTitles()
+            except Exception:
+                titles = []
+            for t in titles:
+                if self._is_likely_call_title(str(t or "")):
+                    if has_call_app or has_call_audio:
+                        return True
+                    if has_browser and has_browser_audio:
+                        return True
         return False
 
+    def detect_call(self) -> bool:
+        now = time.monotonic()
+        if self._call_detect_cache and now < self._call_hold_until:
+            return True
+        if now - self._call_last_probe < self.CALL_PROBE_INTERVAL_SEC:
+            return self._call_detect_cache
+        self._call_last_probe = now
+
+        detected = self._probe_call_now()
+        if detected:
+            self._call_detect_cache = True
+            self._call_hold_until = now + self.CALL_HOLD_SECONDS
+            return True
+        if now >= self._call_hold_until:
+            self._call_detect_cache = False
+        return self._call_detect_cache
+
     def load_today(self):
+        self._confirm_pause_no()
         self.current_day = date.today()
         row = self.store.get_timer_log(self.current_day)
         self.work_seconds = row["work"]
@@ -2393,13 +4426,18 @@ class TimerPanel(QFrame):
         self.running = False
         self.timer.stop()
         self.warn_timer.stop()
+        self._hide_idle_warning()
+        self._idle_episode_active = False
+        self._idle_episode_seconds = 0
+        self._confirm_pause_no()
         self.persist()
 
     def start(self):
         if self.running:
             return
         self.running = True
-        self.timer.start()
+        if self.tracking_enabled:
+            self.timer.start()
 
     def set_idle_threshold(self, seconds: int):
         try:
@@ -2413,9 +4451,7 @@ class TimerPanel(QFrame):
             return
         self.warning_active = True
         self.idle_label.setVisible(True)
-        self.setMinimumHeight(76)
-        self.setMaximumHeight(76)
-        self.height_changed.emit(76)
+        self._sync_panel_height()
         self.warn_timer.start()
 
     def _hide_idle_warning(self):
@@ -2424,9 +4460,66 @@ class TimerPanel(QFrame):
         self.warning_active = False
         self.warn_timer.stop()
         self.idle_label.setVisible(False)
-        self.setMinimumHeight(56)
-        self.setMaximumHeight(56)
-        self.height_changed.emit(56)
+        self._sync_panel_height()
+
+    def _sync_panel_height(self):
+        extra = 0
+        if self.idle_label.isVisible():
+            extra += 20
+        if self.pause_confirm_row.isVisible():
+            extra += 30
+        total = 56 + extra
+        self.setMinimumHeight(total)
+        self.setMaximumHeight(total)
+        self.height_changed.emit(total)
+
+    def _queue_pause_confirmation(self, seconds: int):
+        secs = max(0, int(seconds))
+        if secs <= 0:
+            return
+        self._unconfirmed_pause_seconds += secs
+        self.pause_confirm_label.setText(
+            f"{seconds_to_hhmmss(self._unconfirmed_pause_seconds)} idle gedetecteerd. Als pauze registreren?"
+        )
+        self.pause_confirm_row.setVisible(True)
+        self.pause_confirm_timer.start()
+        self._sync_panel_height()
+
+    def _confirm_pause_yes(self):
+        self.pause_confirm_timer.stop()
+        if self._unconfirmed_pause_seconds > 0:
+            self.idle_seconds += int(self._unconfirmed_pause_seconds)
+            self._unconfirmed_pause_seconds = 0
+            self.persist()
+        self.pause_confirm_row.setVisible(False)
+        self.update_ui()
+        self._sync_panel_height()
+
+    def _confirm_pause_no(self):
+        self.pause_confirm_timer.stop()
+        self._unconfirmed_pause_seconds = 0
+        self.pause_confirm_row.setVisible(False)
+        self.update_ui()
+        self._sync_panel_height()
+
+    def set_os_context(self, locked: bool | None = None, sleeping: bool | None = None):
+        if locked is not None:
+            self.os_session_locked = bool(locked)
+        if sleeping is not None:
+            self.os_system_sleeping = bool(sleeping)
+        suppress = (self.os_session_locked and not self.include_lockscreen_idle) or (
+            self.os_system_sleeping and not self.include_sleep_idle
+        )
+        if suppress:
+            self._hide_idle_warning()
+            self._idle_episode_active = False
+            self._idle_episode_seconds = 0
+        self.update_ui()
+
+    def set_idle_policy(self, include_lockscreen_idle: bool, include_sleep_idle: bool):
+        self.include_lockscreen_idle = bool(include_lockscreen_idle)
+        self.include_sleep_idle = bool(include_sleep_idle)
+        self.set_os_context()
 
     def _animate_warning(self):
         self.warning_alpha += self.warning_direction
@@ -2440,8 +4533,28 @@ class TimerPanel(QFrame):
     def _tick(self):
         if not self.running:
             return
+        if not self.tracking_enabled:
+            return
         if date.today() != self.current_day:
             self.load_today()
+
+        # Timer telt altijd werktijd zolang tracking actief is.
+        self.work_seconds += 1
+
+        # Via policy bepaal je expliciet of lock/sleep als pauze-kandidaat meetelt.
+        suppress = (self.os_session_locked and not self.include_lockscreen_idle) or (
+            self.os_system_sleeping and not self.include_sleep_idle
+        )
+        if suppress:
+            self._hide_idle_warning()
+            self._idle_episode_active = False
+            self._idle_episode_seconds = 0
+            self.save_tick += 1
+            if self.save_tick >= self.save_interval:
+                self.persist()
+                self.save_tick = 0
+            self.update_ui()
+            return
 
         idle_sec = self.get_idle_time()
         warning_sec = max(5, min(30, self.idle_threshold_sec // 6))
@@ -2450,10 +4563,15 @@ class TimerPanel(QFrame):
         else:
             self._hide_idle_warning()
 
-        if idle_sec >= self.idle_threshold_sec:
-            self.idle_seconds += 1
-        else:
-            self.work_seconds += 1
+        is_idle = idle_sec >= self.idle_threshold_sec
+        if is_idle:
+            self._idle_episode_active = True
+            self._idle_episode_seconds += 1
+        elif self._idle_episode_active:
+            self._idle_episode_active = False
+            if self._idle_episode_seconds > 0:
+                self._queue_pause_confirmation(self._idle_episode_seconds)
+            self._idle_episode_seconds = 0
 
         if self.detect_call():
             self.call_seconds += 1
@@ -2469,11 +4587,270 @@ class TimerPanel(QFrame):
         self.on_refresh()
 
     def update_ui(self):
+        suffix_parts = []
+        if not self.tracking_enabled:
+            suffix_parts.append("uit")
+        if self.os_session_locked:
+            suffix_parts.append("vergrendeld")
+        if self.os_system_sleeping:
+            suffix_parts.append("slaapstand")
+        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
         self.lbl_line.setText(
-            f"T: {seconds_to_hhmmss(self.work_seconds)}  I: {seconds_to_hhmmss(self.idle_seconds)}  C: {seconds_to_hhmmss(self.call_seconds)}"
+            f"T: {seconds_to_hhmmss(self.work_seconds)}  P: {seconds_to_hhmmss(self.idle_seconds)}  C: {seconds_to_hhmmss(self.call_seconds)}{suffix}"
         )
 
 
+# ============================================================================
+# DASHBOARD WIDGETS
+# Custom widgets voor visualisatie zonder externe chart-library.
+# Elk widget tekent zelf om layout, kleurgebruik en performance consistent te
+# houden met de rest van de applicatie.
+# ============================================================================
+class PieChartWidget(QWidget):
+    """Compacte pie chart.
+
+    De chart wordt volledig met QPainter gerenderd voor strakke controle over
+    labels, percentages en sizing. Hierdoor vermijden we extra chart-packages
+    en houden we het dashboard visueel consistent met de rest van de app.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.slices: list[tuple[str, float, str]] = []
+        self.center_text = "Geen data"
+        self.setMinimumSize(180, 180)
+
+    def set_slices(self, slices: list[tuple[str, float, str]], center_text: str):
+        self.slices = [(lbl, max(0.0, float(val)), clr) for lbl, val, clr in (slices or [])]
+        self.center_text = center_text or ""
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = self.rect().adjusted(10, 10, -10, -10)
+        p.fillRect(r, QColor(28, 36, 49, 170))
+        p.setPen(QPen(QColor(120, 145, 178), 1))
+        p.drawRoundedRect(r, 8, 8)
+
+        side = max(60, min(r.width() - 36, r.height() - 36))
+        pie_rect = QRect(
+            r.center().x() - (side // 2),
+            r.center().y() - (side // 2),
+            side,
+            side,
+        )
+        total = sum(v for _lbl, v, _clr in self.slices)
+        if total <= 0.0:
+            p.setPen(QColor("#dce4f0"))
+            p.drawText(r, Qt.AlignCenter, "Geen data")
+            return
+
+        start = 90 * 16
+        for _lbl, value, clr in self.slices:
+            if value <= 0:
+                continue
+            span = int(round((value / total) * 360 * 16))
+            p.setBrush(QColor(clr))
+            p.setPen(QPen(QColor("#0f1724"), 1))
+            p.drawPie(pie_rect, start, -span)
+
+            # Percentage-label in slice (alleen als segment groot genoeg is).
+            pct = (value / total) * 100.0
+            if pct >= 7.0:
+                mid_deg = (start - (span / 2.0)) / 16.0
+                radius = (pie_rect.width() / 2.0) * 0.64
+                cx = pie_rect.center().x()
+                cy = pie_rect.center().y()
+                tx = int(cx + (radius * math.cos(math.radians(mid_deg))))
+                ty = int(cy - (radius * math.sin(math.radians(mid_deg))))
+                txt_rect = QRect(tx - 20, ty - 10, 40, 20)
+                p.setPen(QColor("#f8fbff"))
+                p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+                p.drawText(txt_rect, Qt.AlignCenter, f"{int(round(pct))}%")
+            start -= span
+
+        inner = pie_rect.adjusted(int(pie_rect.width() * 0.23), int(pie_rect.height() * 0.23), -int(pie_rect.width() * 0.23), -int(pie_rect.height() * 0.23))
+        p.setBrush(QColor("#1f2835"))
+        p.setPen(QPen(QColor("#3a4658"), 1))
+        p.drawEllipse(inner)
+        p.setPen(QColor("#e6edf7"))
+        p.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        p.drawText(inner, Qt.AlignCenter, self.center_text)
+
+
+class DashboardPieTile(QGroupBox):
+    def __init__(self, title: str, subtitle: str, parent: QWidget | None = None):
+        super().__init__(title, parent)
+        lay = QVBoxLayout(self)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_sub = QLabel(subtitle)
+        self.lbl_sub.setWordWrap(True)
+        self.chart = PieChartWidget()
+        self.chart.setMinimumHeight(170)
+        self.chart.setMaximumHeight(240)
+        self.lbl_legend = QLabel("")
+        self.lbl_legend.setWordWrap(True)
+        self.lbl_legend.setStyleSheet("color:#d3deea;")
+        self.lbl_note = QLabel("")
+        self.lbl_note.setWordWrap(True)
+        self.lbl_note.setStyleSheet("color:#b8c7d8;")
+        lay.addWidget(self.lbl_sub)
+        lay.addWidget(self.chart)
+        lay.addWidget(self.lbl_legend)
+        lay.addWidget(self.lbl_note)
+
+    def set_data(self, slices: list[tuple[str, float, str]], center_text: str, note: str):
+        self.chart.set_slices(slices, center_text)
+        total = sum(max(0.0, float(v)) for _lbl, v, _clr in (slices or []))
+        lines = []
+        for lbl, value, clr in slices or []:
+            v = max(0.0, float(value))
+            pct = int(round((v / total) * 100)) if total > 0 else 0
+            lines.append(f"<span style='color:{clr};'>¦</span> {lbl}: {pct}%")
+        self.lbl_legend.setText(" | ".join(lines))
+        self.lbl_note.setText(note)
+
+
+class TrendLineWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.points: list[tuple[str, float]] = []
+        self.setMinimumHeight(180)
+
+    def set_points(self, points: list[tuple[str, float]]):
+        self.points = list(points or [])
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = self.rect().adjusted(10, 10, -10, -10)
+        p.fillRect(r, QColor(28, 36, 49, 170))
+        p.setPen(QPen(QColor(120, 145, 178), 1))
+        p.drawRoundedRect(r, 8, 8)
+        if len(self.points) < 2:
+            p.setPen(QColor("#dce4f0"))
+            p.drawText(r, Qt.AlignCenter, "Te weinig data voor trend")
+            return
+        left = r.left() + 24
+        right = r.right() - 12
+        top = r.top() + 16
+        bottom = r.bottom() - 22
+        p.setPen(QPen(QColor(88, 105, 126), 1))
+        p.drawLine(left, bottom, right, bottom)
+        p.drawLine(left, top, left, bottom)
+        values = [v for _l, v in self.points]
+        vmax = max(1.0, max(values))
+        n = len(self.points)
+        pts = []
+        for i, (label, v) in enumerate(self.points):
+            x = left + int((i / max(1, n - 1)) * (right - left))
+            y = bottom - int((v / vmax) * (bottom - top))
+            pts.append(QPoint(x, y))
+            if n <= 12 or i % max(1, n // 6) == 0:
+                p.setPen(QColor("#9eb3cc"))
+                p.setFont(QFont("Segoe UI", 7))
+                p.drawText(QRect(x - 20, bottom + 2, 40, 16), Qt.AlignCenter, label)
+        p.setPen(QPen(QColor("#60a5fa"), 2))
+        for i in range(1, len(pts)):
+            p.drawLine(pts[i - 1], pts[i])
+        p.setBrush(QColor("#93c5fd"))
+        p.setPen(QPen(QColor("#dbeafe"), 1))
+        for pt in pts:
+            p.drawEllipse(pt, 2, 2)
+
+
+class CategoryBarWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.values: list[tuple[str, float, str]] = []
+        self.setMinimumHeight(180)
+
+    def set_values(self, values: list[tuple[str, float, str]]):
+        self.values = [(lbl, max(0.0, float(v)), clr) for lbl, v, clr in (values or [])]
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = self.rect().adjusted(10, 10, -10, -10)
+        p.fillRect(r, QColor(28, 36, 49, 170))
+        p.setPen(QPen(QColor(120, 145, 178), 1))
+        p.drawRoundedRect(r, 8, 8)
+        if not self.values:
+            p.setPen(QColor("#dce4f0"))
+            p.drawText(r, Qt.AlignCenter, "Geen categorie-data")
+            return
+        left = r.left() + 18
+        right = r.right() - 12
+        top = r.top() + 18
+        bottom = r.bottom() - 18
+        w = max(120, right - left)
+        vmax = max(1.0, max(v for _l, v, _c in self.values))
+        total = max(1.0, sum(v for _l, v, _c in self.values))
+        row_h = max(18, int((bottom - top) / max(1, len(self.values))))
+        for i, (label, value, clr) in enumerate(self.values):
+            y = top + (i * row_h)
+            p.setPen(QColor("#c8d6e6"))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(QRect(left, y, 120, row_h - 2), Qt.AlignVCenter | Qt.AlignLeft, label)
+            bar_x = left + 120
+            bar_w = int(((w - 190) * (value / vmax)))
+            p.setBrush(QColor(clr))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRect(bar_x, y + 4, max(2, bar_w), row_h - 8), 4, 4)
+            p.setPen(QColor("#e6edf7"))
+            pct = int(round((value / total) * 100))
+            p.drawText(QRect(bar_x + bar_w + 6, y, 58, row_h), Qt.AlignVCenter | Qt.AlignLeft, f"{pct}%")
+
+
+class DashboardTrendTile(QGroupBox):
+    def __init__(self, title: str, subtitle: str, parent: QWidget | None = None):
+        super().__init__(title, parent)
+        lay = QVBoxLayout(self)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_sub = QLabel(subtitle)
+        self.lbl_sub.setWordWrap(True)
+        self.chart = TrendLineWidget()
+        self.lbl_note = QLabel("")
+        self.lbl_note.setWordWrap(True)
+        self.lbl_note.setStyleSheet("color:#b8c7d8;")
+        lay.addWidget(self.lbl_sub)
+        lay.addWidget(self.chart, 1)
+        lay.addWidget(self.lbl_note)
+
+    def set_data(self, points: list[tuple[str, float]], note: str):
+        self.chart.set_points(points)
+        self.lbl_note.setText(note)
+
+
+class DashboardBarTile(QGroupBox):
+    def __init__(self, title: str, subtitle: str, parent: QWidget | None = None):
+        super().__init__(title, parent)
+        lay = QVBoxLayout(self)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_sub = QLabel(subtitle)
+        self.lbl_sub.setWordWrap(True)
+        self.chart = CategoryBarWidget()
+        self.lbl_note = QLabel("")
+        self.lbl_note.setWordWrap(True)
+        self.lbl_note.setStyleSheet("color:#b8c7d8;")
+        lay.addWidget(self.lbl_sub)
+        lay.addWidget(self.chart, 1)
+        lay.addWidget(self.lbl_note)
+
+    def set_data(self, values: list[tuple[str, float, str]], note: str):
+        self.chart.set_values(values)
+        self.lbl_note.setText(note)
+
+
+# ============================================================================
+# MAIN APP ORCHESTRATION
+# MainWindow verbindt opslag, kalenderweergaven, dialogs en dashboard.
+# De klasse is groot omdat dit project momenteel single-file is; methodes zijn
+# thematisch gegroepeerd om toekomstige opsplitsing naar modules eenvoudiger te maken.
+# ============================================================================
 class MainWindow(QMainWindow):
     """Hoofdvenster.
 
@@ -2491,14 +4868,18 @@ class MainWindow(QMainWindow):
         self.mode = "worked"
         self.dark_mode = True
         (
-            self.colors,
+            self.worked_colors,
+            self.planned_colors,
             self.extra_info_colors,
             self.idle_threshold_sec,
+            self.include_lockscreen_idle,
+            self.include_sleep_idle,
             self.extra_info_enabled,
             self.school_region,
             self.inactive_glass_opacity,
             self.min_inactive_glass_opacity,
             self.max_inactive_glass_opacity,
+            self.timer_enabled,
         ) = self.load_color_settings()
         self.min_inactive_glass_opacity = GLASS_OPACITY_MIN
         self.max_inactive_glass_opacity = GLASS_OPACITY_MAX
@@ -2515,8 +4896,6 @@ class MainWindow(QMainWindow):
         self._allow_close = False
         self._slide_anim = None
         self._sliding = False
-        self._needs_year_refresh = False
-        self._needs_month_refresh = False
         self._planner_target_geometry = QRect(120, 80, 2140, 1050)
         self.setWindowTitle(f"Tijdplanner Pro - {self.year}")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -2555,33 +4934,39 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow { background: #1c212b; }
-            QMainWindow[modeTheme="worked"] { background: #1b2620; }
+            QMainWindow[modeTheme="worked"] { background: #1c212b; }
             QMainWindow[modeTheme="planned"] { background: #1c212b; }
             QMenuBar { background: #121720; color: #e8edf7; padding: 5px; font: 10pt "Segoe UI"; }
             QMenuBar::item:selected { background: #355071; color:#ffffff; border-radius: 4px; }
+            QMainWindow[modeTheme="worked"] QMenuBar::item:selected { background: #355071; }
             QMenu { background: #1d2532; color: #e8edf7; border: 1px solid #344156; }
             QMenu::item { padding: 6px 20px; border-radius: 4px; }
             QMenu::item:selected { background: #355071; color: #ffffff; }
+            QMainWindow[modeTheme="worked"] QMenu::item:selected { background: #355071; }
             QDialog, QMessageBox { background: #1c2430; color: #e6edf3; }
             QToolTip { color: #e6edf3; background-color: #10151d; border: 1px solid #3b4a60; padding: 6px; }
             QToolBar { background: #232c3a; border: 0; spacing: 8px; padding: 6px; }
+            QMainWindow[modeTheme="worked"] QToolBar { background: #232c3a; }
             QPushButton { background: #3f6ea6; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font: 10pt "Segoe UI Semibold"; }
             QPushButton:hover { background: #4e7fba; }
             QPushButton:pressed { background: #325987; }
+            QMainWindow[modeTheme="worked"] QPushButton { background: #3f6ea6; }
+            QMainWindow[modeTheme="worked"] QPushButton:hover { background: #4e7fba; }
+            QMainWindow[modeTheme="worked"] QPushButton:pressed { background: #325987; }
             QLabel#modeLeft, QLabel#modeRight { color:#9fb0c5; font: 10pt "Segoe UI Semibold"; padding: 0 4px; }
-            QLabel#modeLeft[active="true"] { color:#9be3be; }
+            QLabel#modeLeft[active="true"] { color:#9ecbff; }
             QLabel#modeRight[active="true"] { color:#9ecbff; }
             QCheckBox#modeSwitch { spacing:0px; }
             QCheckBox#modeSwitch::indicator {
                 width:56px; height:28px; border-radius:14px;
                 border:1px solid #32465f;
-                background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3f7e5c, stop:1 #2a5a41);
+                background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4d6f96, stop:1 #2f4f75);
             }
             QCheckBox#modeSwitch::indicator:unchecked {
-                border-top:1px solid #88c6a7;
-                border-left:1px solid #79b796;
-                border-right:1px solid #2f4f44;
-                border-bottom:2px solid #1f342b;
+                border-top:1px solid #a8c6e7;
+                border-left:1px solid #9bb8d7;
+                border-right:1px solid #324a62;
+                border-bottom:2px solid #213344;
             }
             QCheckBox#modeSwitch::indicator:checked {
                 border-top:1px solid #a8c6e7;
@@ -2590,32 +4975,61 @@ class MainWindow(QMainWindow):
                 border-bottom:2px solid #213344;
                 background:qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4d6f96, stop:1 #2f4f75);
             }
-            QFrame#timerPanel QPushButton[active="true"] { background:#2f6f4b; border:1px solid #47946a; }
+            QFrame#timerPanel QPushButton[active="true"] { background:#355071; border:1px solid #4c739f; }
+            QMainWindow[modeTheme="worked"] QFrame#timerPanel QPushButton[active="true"] { background:#355071; border:1px solid #4c739f; }
             QTabWidget::pane { border: 1px solid #3a4658; background: #222b38; border-radius: 8px; }
-            QTabBar::tab { background: #2a3443; color: #d6deea; padding: 10px 18px; margin-right: 4px; border-top-left-radius: 8px; border-top-right-radius: 8px; font: 10pt "Segoe UI Semibold"; }
-            QTabBar::tab:selected { background: #222b38; }
-            QTabBar#monthTabBar::tab { background: #283240; color: #d6deea; margin-right: 3px; border: 1px solid #3a4658; border-bottom: 0; }
-            QTabBar#monthTabBar::tab:selected { background: #355071; color: #f3f8ff; }
+            QMainWindow[modeTheme="worked"] QTabWidget::pane { border: 1px solid #3a4658; background: #222b38; }
+            QTabBar::tab { background: #2a3443; color: #cfd8e6; padding: 10px 18px; margin-right: 4px; border-top-left-radius: 8px; border-top-right-radius: 8px; border: 1px solid #3a4658; border-bottom: 0; font: 10pt "Segoe UI Semibold"; }
+            QMainWindow[modeTheme="worked"] QTabBar::tab { background: #2a3443; color: #cfd8e6; border: 1px solid #3a4658; border-bottom: 0; }
+            QTabBar::tab:selected { background: #355071; color: #f6fbff; border: 1px solid #5b84b5; border-bottom: 0; font: 10pt "Segoe UI Black"; }
+            QMainWindow[modeTheme="worked"] QTabBar::tab:selected { background: #355071; color: #f6fbff; border: 1px solid #5b84b5; border-bottom: 0; }
+            QTabBar#workedMonthTabBar::tab, QTabBar#plannedMonthTabBar::tab { background: #283240; margin-right: 3px; border: 1px solid #3a4658; border-bottom: 0; }
+            QMainWindow[modeTheme="worked"] QTabBar#workedMonthTabBar::tab, QMainWindow[modeTheme="worked"] QTabBar#plannedMonthTabBar::tab { background: #283240; border: 1px solid #3a4658; border-bottom: 0; }
+            QTabBar#workedMonthTabBar::tab:selected, QTabBar#plannedMonthTabBar::tab:selected { background: #355071; color: #f3f8ff; border: 1px solid #5b84b5; border-bottom: 0; font: 10pt "Segoe UI Black"; }
+            QMainWindow[modeTheme="worked"] QTabBar#workedMonthTabBar::tab:selected, QMainWindow[modeTheme="worked"] QTabBar#plannedMonthTabBar::tab:selected { background: #355071; color: #f3f8ff; border: 1px solid #5b84b5; border-bottom: 0; }
             QScrollArea#calendarScroll { background: #222b38; border: 0; }
-            QScrollArea#calendarScroll[modeTheme="worked"] { background: #223129; }
+            QScrollArea#calendarScroll[modeTheme="worked"] { background: #222b38; }
             QScrollArea#calendarScroll[modeTheme="planned"] { background: #222b38; }
             QWidget#calendarHost { background: #222b38; }
-            QWidget#calendarHost[modeTheme="worked"] { background: #223129; }
+            QWidget#calendarHost[modeTheme="worked"] { background: #222b38; }
             QWidget#calendarHost[modeTheme="planned"] { background: #222b38; }
+            QScrollArea#dashDetailScroll { background: #222b38; border: 1px solid #3a4658; border-radius: 8px; }
+            QWidget#dashDetailHost { background: #263141; }
             QGroupBox { border: 1px solid #3b4759; border-radius: 10px; margin-top: 18px; padding-top: 12px; background: #263141; font: 10pt "Segoe UI Semibold"; color: #e0e7f2; }
+            QMainWindow[modeTheme="worked"] QGroupBox { border: 1px solid #3b4759; background: #263141; color: #e0e7f2; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; top: -2px; padding: 2px 8px; }
             QTableWidget { background: #1f2835; alternate-background-color: #222e3d; border: 1px solid #3a4658; gridline-color: #3a4658; color: #e6edf7; font: 9pt "Segoe UI"; }
+            QMainWindow[modeTheme="worked"] QTableWidget { background: #1f2835; alternate-background-color: #222e3d; border: 1px solid #3a4658; gridline-color: #3a4658; color: #e6edf7; }
+            QTableWidget#dashTableDetail::item { background: transparent; }
+            QTableWidget::item:selected { background: #355071; color: #ffffff; }
             QHeaderView::section { background: #2c3849; color: #dce4f0; padding: 6px; border: 1px solid #425066; font: 9pt "Segoe UI Semibold"; }
+            QMainWindow[modeTheme="worked"] QHeaderView::section { background: #2c3849; color: #dce4f0; border: 1px solid #425066; }
             QStatusBar { background: #232c3a; color: #d8e1ef; border-top: 1px solid #3a4658; font: 9pt "Segoe UI"; }
+            QMainWindow[modeTheme="worked"] QStatusBar { background: #232c3a; border-top: 1px solid #3a4658; }
             QLabel { color: #dce4f0; }
-            QLineEdit, QComboBox { border: 1px solid #45556d; border-radius: 6px; background: #1f2835; color: #eaf1fb; padding: 6px; font: 9pt "Segoe UI"; }
+            QMainWindow[modeTheme="worked"] QLabel { color: #dce4f0; }
+            QCheckBox { color: #dce4f0; spacing: 6px; }
+            QMainWindow[modeTheme="worked"] QCheckBox { color: #dce4f0; }
+            QLineEdit, QComboBox, QDateEdit { border: 1px solid #45556d; border-radius: 6px; background: #1f2835; color: #eaf1fb; padding: 6px; font: 9pt "Segoe UI"; }
+            QMainWindow[modeTheme="worked"] QLineEdit, QMainWindow[modeTheme="worked"] QComboBox, QMainWindow[modeTheme="worked"] QDateEdit { border: 1px solid #45556d; background: #1f2835; color: #eaf1fb; }
             QComboBox::drop-down { border: 0; width: 24px; }
             QComboBox::down-arrow { width: 10px; height: 10px; }
             QComboBox QAbstractItemView { background: #1f2835; color: #eaf1fb; border: 1px solid #45556d; selection-background-color: #355071; selection-color: #ffffff; outline: 0; }
+            QMainWindow[modeTheme="worked"] QComboBox QAbstractItemView { background: #1f2835; color: #eaf1fb; border: 1px solid #45556d; selection-background-color: #355071; }
+            QDateEdit::drop-down { border: 0; width: 24px; }
+            QDateEdit::down-arrow { width: 10px; height: 10px; }
+            QCalendarWidget QWidget { background: #1f2835; color: #eaf1fb; }
+            QCalendarWidget QToolButton { color: #eaf1fb; background: #2a3443; border: 1px solid #45556d; border-radius: 4px; }
+            QCalendarWidget QToolButton:hover { background: #355071; }
+            QCalendarWidget QMenu { background: #1f2835; color: #eaf1fb; }
             QScrollBar:vertical { background: #1a2230; width: 12px; margin: 2px; }
+            QMainWindow[modeTheme="worked"] QScrollBar:vertical { background: #1a2230; }
             QScrollBar::handle:vertical { background: #40516b; border-radius: 5px; min-height: 28px; }
+            QMainWindow[modeTheme="worked"] QScrollBar::handle:vertical { background: #40516b; }
             QScrollBar:horizontal { background: #1a2230; height: 12px; margin: 2px; }
+            QMainWindow[modeTheme="worked"] QScrollBar:horizontal { background: #1a2230; }
             QScrollBar::handle:horizontal { background: #40516b; border-radius: 5px; min-width: 28px; }
+            QMainWindow[modeTheme="worked"] QScrollBar::handle:horizontal { background: #40516b; }
             """
         )
 
@@ -2631,59 +5045,257 @@ class MainWindow(QMainWindow):
         content_lay.setContentsMargins(6, 6, 6, 6)
 
         self.tabs = QTabWidget()
-        self.tabs.tabBar().hide()
+        self.tabs.tabBar().setExpanding(False)
         content_lay.addWidget(self.tabs)
-        self.tab_year = QWidget()
-        self.tab_month = QWidget()
-        self.tabs.addTab(self.tab_year, "Jaarweergave")
-        self.tabs.addTab(self.tab_month, "Maandweergave")
+        self.tab_worked = QWidget()
+        self.tab_planned = QWidget()
+        self.tab_dashboard = QWidget()
+        self.tabs.addTab(self.tab_worked, "Uren")
+        self.tabs.addTab(self.tab_planned, "Planning")
+        self.tabs.addTab(self.tab_dashboard, "Dashboard")
 
-        year_layout = QVBoxLayout(self.tab_year)
-        self.year_board = CalendarBoard(
+        worked_layout = QVBoxLayout(self.tab_worked)
+        self.worked_month_tabbar = QTabBar()
+        self.worked_month_tabbar.setObjectName("workedMonthTabBar")
+        self.worked_month_tabbar.setDrawBase(False)
+        self.worked_month_tabbar.setExpanding(False)
+        self.worked_month_tabbar.setUsesScrollButtons(True)
+        self.worked_month_tabbar.setElideMode(Qt.ElideNone)
+        self.worked_month_tabbar.addTab("Jaaroverzicht")
+        for m in MONTHS_NL:
+            self.worked_month_tabbar.addTab(m)
+        self.worked_month_tabbar.setCurrentIndex(0)
+        self.worked_month_tabbar.setMaximumHeight(36)
+        self.worked_month_tabbar.installEventFilter(self)
+        self.worked_month_tabbar.currentChanged.connect(self.on_worked_period_tab_changed)
+        worked_layout.addWidget(self.worked_month_tabbar)
+        self.worked_year_board = CalendarBoard(
             self.store,
             self.year,
-            self.mode,
+            "worked",
             list(range(1, 13)),
             3,
             focus_mode=False,
             dark_mode=self.dark_mode,
-            colors=self.colors,
+            colors=self.worked_colors,
             extra_info_colors=self.extra_info_colors,
         )
-        self.year_board.day_double_clicked.connect(self.edit_day)
-        year_layout.addWidget(self.year_board)
-
-        month_layout = QVBoxLayout(self.tab_month)
-        self.month_tabbar = QTabBar()
-        self.month_tabbar.setObjectName("monthTabBar")
-        self.month_tabbar.setDrawBase(False)
-        self.month_tabbar.setExpanding(False)
-        self.month_tabbar.setUsesScrollButtons(True)
-        self.month_tabbar.setElideMode(Qt.ElideNone)
-        for m in MONTHS_NL:
-            self.month_tabbar.addTab(m)
-        self.month_tabbar.setCurrentIndex(date.today().month - 1)
-        self.month_tabbar.setMaximumHeight(36)
-        self.month_tabbar.installEventFilter(self)
-        self.month_tabbar.currentChanged.connect(self.on_month_tab_changed)
-        month_layout.addWidget(self.month_tabbar)
-        self.month_board = CalendarBoard(
+        self.worked_year_board.installEventFilter(self)
+        self.worked_year_board.scroll.installEventFilter(self)
+        self.worked_year_board.host.installEventFilter(self)
+        self.worked_year_board.day_double_clicked.connect(self.edit_day)
+        self.worked_year_board.day_range_selected.connect(self.open_bulk_planning)
+        worked_layout.addWidget(self.worked_year_board, 1)
+        self.worked_board = CalendarBoard(
             self.store,
             self.year,
-            self.mode,
-            [self.month_tabbar.currentIndex() + 1],
+            "worked",
+            [max(1, date.today().month)],
             1,
             focus_mode=True,
             dark_mode=self.dark_mode,
-            colors=self.colors,
+            colors=self.worked_colors,
             extra_info_colors=self.extra_info_colors,
         )
-        self.month_board.installEventFilter(self)
-        self.month_board.scroll.installEventFilter(self)
-        self.month_board.host.installEventFilter(self)
-        self.month_board.day_double_clicked.connect(self.edit_day)
-        self.month_board.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        month_layout.addWidget(self.month_board, 1)
+        self.worked_board.installEventFilter(self)
+        self.worked_board.scroll.installEventFilter(self)
+        self.worked_board.host.installEventFilter(self)
+        self.worked_board.day_double_clicked.connect(self.edit_day)
+        self.worked_board.day_range_selected.connect(self.open_bulk_planning)
+        self.worked_board.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        worked_layout.addWidget(self.worked_board, 1)
+        self.worked_board.setVisible(False)
+
+        planned_layout = QVBoxLayout(self.tab_planned)
+        self.planned_month_tabbar = QTabBar()
+        self.planned_month_tabbar.setObjectName("plannedMonthTabBar")
+        self.planned_month_tabbar.setDrawBase(False)
+        self.planned_month_tabbar.setExpanding(False)
+        self.planned_month_tabbar.setUsesScrollButtons(True)
+        self.planned_month_tabbar.setElideMode(Qt.ElideNone)
+        self.planned_month_tabbar.addTab("Jaaroverzicht")
+        for m in MONTHS_NL:
+            self.planned_month_tabbar.addTab(m)
+        self.planned_month_tabbar.setCurrentIndex(0)
+        self.planned_month_tabbar.setMaximumHeight(36)
+        self.planned_month_tabbar.installEventFilter(self)
+        self.planned_month_tabbar.currentChanged.connect(self.on_planned_period_tab_changed)
+        planned_layout.addWidget(self.planned_month_tabbar)
+        self.planned_year_board = CalendarBoard(
+            self.store,
+            self.year,
+            "planned",
+            list(range(1, 13)),
+            3,
+            focus_mode=False,
+            dark_mode=self.dark_mode,
+            colors=self.planned_colors,
+            extra_info_colors=self.extra_info_colors,
+        )
+        self.planned_year_board.installEventFilter(self)
+        self.planned_year_board.scroll.installEventFilter(self)
+        self.planned_year_board.host.installEventFilter(self)
+        self.planned_year_board.day_double_clicked.connect(self.edit_day)
+        self.planned_year_board.day_range_selected.connect(self.open_bulk_planning)
+        planned_layout.addWidget(self.planned_year_board, 1)
+        self.planned_board = CalendarBoard(
+            self.store,
+            self.year,
+            "planned",
+            [max(1, date.today().month)],
+            1,
+            focus_mode=True,
+            dark_mode=self.dark_mode,
+            colors=self.planned_colors,
+            extra_info_colors=self.extra_info_colors,
+        )
+        self.planned_board.installEventFilter(self)
+        self.planned_board.scroll.installEventFilter(self)
+        self.planned_board.host.installEventFilter(self)
+        self.planned_board.day_double_clicked.connect(self.edit_day)
+        self.planned_board.day_range_selected.connect(self.open_bulk_planning)
+        self.planned_board.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        planned_layout.addWidget(self.planned_board, 1)
+        self.planned_board.setVisible(False)
+
+        dash_layout = QVBoxLayout(self.tab_dashboard)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Snelfilter"))
+        self.dash_period = QComboBox()
+        self.dash_period.addItems(["Huidige maand", "Laatste 30 dagen", "Dit jaar", "Aangepast"])
+        filter_row.addWidget(self.dash_period)
+        filter_row.addWidget(QLabel("Begin"))
+        self.dash_from = QLineEdit()
+        self.dash_from.setPlaceholderText("dd-mm-jjjj")
+        filter_row.addWidget(self.dash_from)
+        filter_row.addWidget(QLabel("Eind"))
+        self.dash_to = QLineEdit()
+        self.dash_to.setPlaceholderText("dd-mm-jjjj")
+        filter_row.addWidget(self.dash_to)
+        self.dash_include_weekend = QCheckBox("Weekend meenemen")
+        self.dash_include_weekend.setChecked(True)
+        self.dash_include_weekend.setStyleSheet("color:#dce4f0;")
+        filter_row.addWidget(self.dash_include_weekend)
+        self.btn_dash_refresh = QPushButton("Vernieuwen")
+        filter_row.addWidget(self.btn_dash_refresh)
+        filter_row.addStretch(1)
+        dash_layout.addLayout(filter_row)
+
+        kpi_box = QGroupBox("Kerncijfers")
+        kpi_box.setMinimumHeight(130)
+        kpi_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        kpi_grid = QGridLayout(kpi_box)
+        kpi_grid.setContentsMargins(12, 12, 12, 10)
+        kpi_grid.setHorizontalSpacing(18)
+        kpi_grid.setVerticalSpacing(8)
+        self.lbl_dash_work = QLabel("Totaal gewerkt: 00:00")
+        self.lbl_dash_planned = QLabel("Totaal gepland: 00:00")
+        self.lbl_dash_idle = QLabel("Totaal pauze: 00:00")
+        self.lbl_dash_call = QLabel("Totaal call: 00:00")
+        self.lbl_dash_ratio = QLabel("Productief ratio: 0%")
+        self.lbl_dash_days = QLabel("Actieve dagen: 0")
+        self.lbl_dash_avg = QLabel("Gemiddeld/dag: 00:00")
+        self.lbl_dash_variance = QLabel("Afwijking gepland vs gewerkt: 00:00")
+        self.lbl_dash_budget = QLabel("Contract: 00:00 | Nog te plannen: 00:00 | Vrij over: 00:00")
+        # Layout volgens dashboard best-practice: KPI's compact bovenin, charts daaronder.
+        kpi_grid.addWidget(self.lbl_dash_work, 0, 0)
+        kpi_grid.addWidget(self.lbl_dash_planned, 0, 1)
+        kpi_grid.addWidget(self.lbl_dash_idle, 0, 2)
+        kpi_grid.addWidget(self.lbl_dash_call, 0, 3)
+        kpi_grid.addWidget(self.lbl_dash_ratio, 1, 0)
+        kpi_grid.addWidget(self.lbl_dash_days, 1, 1)
+        kpi_grid.addWidget(self.lbl_dash_avg, 1, 2)
+        kpi_grid.addWidget(self.lbl_dash_variance, 1, 3)
+        kpi_grid.addWidget(self.lbl_dash_budget, 2, 0, 1, 4)
+        for c in range(4):
+            kpi_grid.setColumnStretch(c, 1)
+
+        dash_body = QHBoxLayout()
+        left_host = QWidget()
+        left_lay = QVBoxLayout(left_host)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(8)
+
+        tile_grid = QGridLayout()
+        tile_grid.setHorizontalSpacing(10)
+        tile_grid.setVerticalSpacing(10)
+        self.tile_mix = DashboardPieTile("Urenmix", "Verdeling van werk-, pauze- en calltijd binnen de gekozen periode.")
+        self.tile_mix2 = DashboardPieTile("Planningbalans", "Inzicht in boven planning, onder planning en dagen op schema.")
+        self.tile_cat = DashboardBarTile("Plan vs Werk", "Afwijking ten opzichte van planning in de gekozen periode.")
+        self.tile_mix.setMinimumHeight(250)
+        self.tile_mix2.setMinimumHeight(250)
+        self.tile_cat.setMinimumHeight(520)
+        self.tile_mix.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tile_mix2.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tile_cat.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        tile_grid.addWidget(self.tile_mix, 0, 0)
+        tile_grid.addWidget(self.tile_mix2, 1, 0)
+        tile_grid.addWidget(self.tile_cat, 0, 1, 2, 1)
+        tile_grid.setColumnStretch(0, 1)
+        tile_grid.setColumnStretch(1, 1)
+        left_lay.addWidget(kpi_box)
+        left_lay.addLayout(tile_grid, 1)
+        left_host.setLayout(left_lay)
+
+        self.health_box = QGroupBox("Data Health")
+        health_lay = QGridLayout(self.health_box)
+        health_lay.setContentsMargins(10, 10, 10, 10)
+        health_lay.setHorizontalSpacing(10)
+        health_lay.setVerticalSpacing(6)
+        self.lbl_health_save = QLabel("Laatste save: onbekend")
+        self.lbl_health_backup = QLabel("Laatste backup: onbekend")
+        self.lbl_health_snapshots = QLabel("Snapshots: 0")
+        self.lbl_health_status = QLabel("Status: onbekend")
+        health_lay.addWidget(self.lbl_health_save, 0, 0)
+        health_lay.addWidget(self.lbl_health_backup, 0, 1)
+        health_lay.addWidget(self.lbl_health_snapshots, 1, 0)
+        health_lay.addWidget(self.lbl_health_status, 1, 1)
+
+        self.dash_table = QTableWidget(0, 6)
+        self.dash_table.setObjectName("dashTableDetail")
+        self.dash_table.setHorizontalHeaderLabels(["Datum", "Gepland", "Gewerkt", "Afwijking", "Pauze", "Call"])
+        self.dash_table.verticalHeader().setVisible(False)
+        self.dash_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.dash_table.setSelectionMode(QTableWidget.NoSelection)
+        self.dash_table.setAlternatingRowColors(True)
+        self.dash_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in (1, 2, 3, 4, 5):
+            self.dash_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.dash_table.setMinimumHeight(440)
+        self.dash_table.setStyleSheet(
+            "QTableWidget { background:#1f2835; alternate-background-color:#222e3d; color:#e6edf7; } "
+            "QTableWidget::item { background: transparent; } "
+            "QTableWidget QWidget { background:#1f2835; color:#e6edf7; }"
+        )
+        right_host = QWidget()
+        right_host.setObjectName("dashDetailHost")
+        right_lay = QVBoxLayout(right_host)
+        right_lay.setContentsMargins(6, 6, 6, 6)
+        right_lay.setSpacing(8)
+        right_lay.addWidget(self.health_box)
+        right_lay.addWidget(QLabel("Detaildata (scrollbaar)"))
+        right_lay.addWidget(self.dash_table, 1)
+        self.dash_detail_scroll = QScrollArea()
+        self.dash_detail_scroll.setObjectName("dashDetailScroll")
+        self.dash_detail_scroll.setWidgetResizable(True)
+        self.dash_detail_scroll.setWidget(right_host)
+        self.dash_detail_scroll.setMinimumWidth(420)
+        self.dash_detail_scroll.viewport().setStyleSheet("background:#222b38;")
+        self.dash_table.viewport().setStyleSheet("background:#1f2835;")
+
+        dash_body.addWidget(left_host, 3)
+        dash_body.addWidget(self.dash_detail_scroll, 2)
+        dash_layout.addLayout(dash_body, 1)
+
+        self.dash_period.currentIndexChanged.connect(self.on_dashboard_period_changed)
+        self.dash_from.editingFinished.connect(self.refresh_dashboard)
+        self.dash_to.editingFinished.connect(self.refresh_dashboard)
+        self.dash_include_weekend.toggled.connect(lambda _: self.refresh_dashboard())
+        self.btn_dash_refresh.clicked.connect(self.refresh_dashboard)
+        self.on_dashboard_period_changed(self.dash_period.currentIndex())
+        self.refresh_dashboard()
+        self._apply_current_month_accent()
+        self.tabs.setCurrentIndex(0)
         self.tabs.currentChanged.connect(self.on_tab_change)
 
     def slide_in_from(self, timer_geo: QRect):
@@ -2774,19 +5386,27 @@ class MainWindow(QMainWindow):
         menu_file.addAction(act_exit)
 
         menu_view = m.addMenu("Beeld")
-        menu_view.addAction("Jaarweergave", lambda: self.tabs.setCurrentIndex(0))
-        menu_view.addAction("Maandweergave", lambda: self.tabs.setCurrentIndex(1))
+        menu_view.addAction("Uren", lambda: self.tabs.setCurrentIndex(0))
+        menu_view.addAction("Planning", lambda: self.tabs.setCurrentIndex(1))
+        menu_view.addAction("Dashboard", lambda: self.tabs.setCurrentIndex(2))
         menu_view.addSeparator()
         menu_view.addAction("Ga naar huidige maand", self.goto_today)
 
         menu_plan = m.addMenu("Planning")
         menu_plan.addAction("Werkpatroon bewerken", self.open_work_pattern_editor)
+        menu_plan.addAction("Dienstverband en jaarbudget", self.open_contract_budget_settings)
+        menu_plan.addAction("Bulk plannen", lambda: self.open_bulk_planning())
         menu_settings = m.addMenu("Instellingen")
         menu_settings.addAction("Kleuren", self.open_color_settings)
         menu_settings.addAction("Aanvullende info opties", self.open_extra_info_settings)
         menu_settings.addAction("Schoolvakantie regio", self.open_school_region_settings)
         menu_settings.addAction("Timer idle detectie", self.open_timer_settings)
-        menu_settings.addAction("Glassmorphism", self.open_glass_settings)
+        self.act_timer_enabled = QAction("Timer uren meten", self)
+        self.act_timer_enabled.setCheckable(True)
+        self.act_timer_enabled.setChecked(bool(self.timer_enabled))
+        self.act_timer_enabled.triggered.connect(self.on_timer_enabled_toggled)
+        menu_settings.addAction(self.act_timer_enabled)
+        menu_settings.addAction("Doorzichtigheid", self.open_glass_settings)
         menu_help = m.addMenu("Help")
         menu_help.addAction("Over", self.about)
 
@@ -2796,7 +5416,7 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 0, 4, 0)
         row.setSpacing(4)
 
-        btn_min = QPushButton("−")
+        btn_min = QPushButton("-")
         btn_close = QPushButton("×")
         for b in (btn_min, btn_close):
             b.setFixedSize(28, 24)
@@ -2821,23 +5441,6 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, tb)
 
-        mode_host = QWidget()
-        mode_row = QHBoxLayout(mode_host)
-        mode_row.setContentsMargins(0, 0, 0, 0)
-        mode_row.setSpacing(6)
-        self.lbl_mode_left = QLabel("Uren")
-        self.lbl_mode_left.setObjectName("modeLeft")
-        self.lbl_mode_right = QLabel("Planning")
-        self.lbl_mode_right.setObjectName("modeRight")
-        self.mode_switch = QCheckBox()
-        self.mode_switch.setObjectName("modeSwitch")
-        self.mode_switch.setTristate(False)
-        self.mode_switch.toggled.connect(lambda checked: self.set_mode("planned" if checked else "worked"))
-        mode_row.addWidget(self.lbl_mode_left)
-        mode_row.addWidget(self.mode_switch)
-        mode_row.addWidget(self.lbl_mode_right)
-        tb.addWidget(mode_host)
-
         self.btn_pattern = QPushButton("Werkpatroon toepassen")
         self.btn_pattern.clicked.connect(self.open_work_pattern_editor)
         self.btn_pattern.setVisible(False)
@@ -2860,97 +5463,328 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self.lbl_saldo)
 
     def refresh_all(self):
-        self.year_board.set_dark_mode(self.dark_mode)
-        self.month_board.set_dark_mode(self.dark_mode)
-        self.year_board.set_colors(self.colors)
-        self.month_board.set_colors(self.colors)
-        self.year_board.set_extra_info_colors(self.extra_info_colors)
-        self.month_board.set_extra_info_colors(self.extra_info_colors)
-        self.year_board.set_mode(self.mode)
-        self.month_board.set_mode(self.mode)
-        self.year_board.refresh()
-        self.month_board.refresh()
-        self._needs_year_refresh = False
-        self._needs_month_refresh = False
+        # We verversen bewust alleen de zichtbare kalendersectie voor performance.
+        # Beide jaar- en maandvarianten telkens opnieuw renderen is merkbaar zwaarder bij grote tabellen
+        # en geeft geen functionele winst zolang de gebruiker die sectie niet ziet.
+        self.worked_year_board.set_dark_mode(self.dark_mode)
+        self.planned_year_board.set_dark_mode(self.dark_mode)
+        self.worked_board.set_dark_mode(self.dark_mode)
+        self.planned_board.set_dark_mode(self.dark_mode)
+        self.worked_year_board.set_colors(self.worked_colors)
+        self.planned_year_board.set_colors(self.planned_colors)
+        self.worked_board.set_colors(self.worked_colors)
+        self.planned_board.set_colors(self.planned_colors)
+        self.worked_year_board.set_extra_info_colors(self.extra_info_colors)
+        self.planned_year_board.set_extra_info_colors(self.extra_info_colors)
+        self.worked_board.set_extra_info_colors(self.extra_info_colors)
+        self.planned_board.set_extra_info_colors(self.extra_info_colors)
+        self.worked_year_board.set_mode("worked")
+        self.planned_year_board.set_mode("planned")
+        self.worked_board.set_mode("worked")
+        self.planned_board.set_mode("planned")
+        # Performance: refresh alleen de zichtbare kalendersectie; andere secties verversen bij activatie.
+        if hasattr(self, "tabs"):
+            tab_idx = self.tabs.currentIndex()
+            if tab_idx == 0:
+                if self.worked_month_tabbar.currentIndex() == 0:
+                    self.worked_year_board.refresh()
+                else:
+                    self.worked_board.refresh()
+            elif tab_idx == 1:
+                if self.planned_month_tabbar.currentIndex() == 0:
+                    self.planned_year_board.refresh()
+                else:
+                    self.planned_board.refresh()
+        else:
+            self.worked_year_board.refresh()
+            self.worked_board.refresh()
         if self.timer_host:
-            self.timer_host.panel.apply_colors(self.colors)
+            self.timer_host.panel.apply_colors(self.active_colors())
         self.lbl_saldo.setText(self.store.get_saldo_text())
         self._refresh_mode_toggle_style()
         self._apply_mode_theme()
+        if hasattr(self, "tabs") and self.tabs.currentIndex() == 2:
+            self.refresh_dashboard()
+
+    def active_colors(self) -> dict[str, str]:
+        return self.planned_colors if self.mode == "planned" else self.worked_colors
 
     def _refresh_mode_toggle_style(self):
-        checked = self.mode == "planned"
-        if self.mode_switch.isChecked() != checked:
-            self.mode_switch.blockSignals(True)
-            self.mode_switch.setChecked(checked)
-            self.mode_switch.blockSignals(False)
-        self.lbl_mode_left.setProperty("active", "true" if self.mode == "worked" else "false")
-        self.lbl_mode_right.setProperty("active", "true" if self.mode == "planned" else "false")
-        for w in (self.mode_switch, self.lbl_mode_left, self.lbl_mode_right):
-            w.style().unpolish(w)
-            w.style().polish(w)
-            w.update()
+        return
+
+    def _apply_current_month_accent(self):
+        today_month = date.today().month
+        normal = QColor("#d6deea")
+        accent = QColor("#56d6ff")
+        for tabbar in (self.worked_month_tabbar, self.planned_month_tabbar):
+            tabbar.setTabTextColor(0, normal)
+            for i in range(1, tabbar.count()):
+                base = MONTHS_NL[i - 1]
+                tabbar.setTabText(i, base)
+                tabbar.setTabTextColor(i, normal)
+            current_idx = today_month  # index 0 is Jaaroverzicht
+            if 1 <= current_idx < tabbar.count():
+                tabbar.setTabTextColor(current_idx, accent)
+            tabbar.update()
 
     def _apply_mode_theme(self):
         mode_theme = "worked" if self.mode == "worked" else "planned"
         self.setProperty("modeTheme", mode_theme)
         for w in (
             self,
-            self.year_board.scroll,
-            self.year_board.host,
-            self.month_board.scroll,
-            self.month_board.host,
+            self.worked_year_board.scroll,
+            self.worked_year_board.host,
+            self.worked_board.scroll,
+            self.worked_board.host,
+            self.planned_year_board.scroll,
+            self.planned_year_board.host,
+            self.planned_board.scroll,
+            self.planned_board.host,
         ):
             w.setProperty("modeTheme", mode_theme)
-            w.style().unpolish(w)
-            w.style().polish(w)
             w.update()
 
     def set_mode(self, mode: str):
         if mode not in ("worked", "planned"):
             return
-        if self.mode == mode:
-            return
-        self.mode = mode
-        is_planned = self.mode == "planned"
-        self.btn_pattern.setVisible(is_planned)
-        self.btn_pattern_edit.setVisible(is_planned)
-        self.year_board.set_mode(self.mode)
-        self.month_board.set_mode(self.mode)
-        self._needs_year_refresh = True
-        self._needs_month_refresh = True
-        if self.tabs.currentIndex() == 0:
-            self.year_board.refresh()
-            self._needs_year_refresh = False
-        else:
-            self.month_board.refresh()
-            self._needs_month_refresh = False
-        self._refresh_mode_toggle_style()
-        self._apply_mode_theme()
-        self.lbl_status.setText("Actieve modus: Planning" if is_planned else "Actieve modus: Uren")
+        self.tabs.setCurrentIndex(1 if mode == "planned" else 0)
 
     def toggle_mode(self):
         self.set_mode("planned" if self.mode == "worked" else "worked")
 
-    def on_month_tab_changed(self, idx: int):
-        self.month_board.set_month(idx + 1)
-        self.month_board.set_mode(self.mode)
-        self.month_board.refresh()
-        self.lbl_status.setText(f"Maand: {MONTHS_NL[idx]}")
+    def on_worked_period_tab_changed(self, idx: int):
+        is_year = idx == 0
+        self.worked_year_board.setVisible(is_year)
+        self.worked_board.setVisible(not is_year)
+        if is_year:
+            self.worked_year_board.refresh()
+            self.lbl_status.setText("Uren: Jaaroverzicht")
+            return
+        month_idx = idx - 1
+        self.worked_board.set_month(month_idx + 1)
+        self.worked_board.set_mode("worked")
+        self.worked_board.refresh()
+        self.lbl_status.setText(f"Uren maand: {MONTHS_NL[month_idx]}")
+
+    def on_planned_period_tab_changed(self, idx: int):
+        is_year = idx == 0
+        self.planned_year_board.setVisible(is_year)
+        self.planned_board.setVisible(not is_year)
+        if is_year:
+            self.planned_year_board.refresh()
+            self.lbl_status.setText("Planning: Jaaroverzicht")
+            return
+        month_idx = idx - 1
+        self.planned_board.set_month(month_idx + 1)
+        self.planned_board.set_mode("planned")
+        self.planned_board.refresh()
+        self.lbl_status.setText(f"Planning maand: {MONTHS_NL[month_idx]}")
 
     def on_tab_change(self, idx: int):
-        if idx == 0 and self._needs_year_refresh:
-            self.year_board.refresh()
-            self._needs_year_refresh = False
-        elif idx == 1 and self._needs_month_refresh:
-            self.month_board.refresh()
-            self._needs_month_refresh = False
-        self.lbl_status.setText("Tab: Jaarweergave" if idx == 0 else "Tab: Maandweergave")
+        if idx == 0:
+            self.mode = "worked"
+            self.btn_pattern.setVisible(False)
+            self.btn_pattern_edit.setVisible(False)
+            self.on_worked_period_tab_changed(self.worked_month_tabbar.currentIndex())
+        elif idx == 1:
+            self.mode = "planned"
+            self.btn_pattern.setVisible(True)
+            self.btn_pattern_edit.setVisible(True)
+            self.on_planned_period_tab_changed(self.planned_month_tabbar.currentIndex())
+        else:
+            self.mode = "planned"
+            self.btn_pattern.setVisible(False)
+            self.btn_pattern_edit.setVisible(False)
+            self.refresh_dashboard()
+        self._refresh_mode_toggle_style()
+        self._apply_mode_theme()
+        self.lbl_status.setText("Tab: Uren" if idx == 0 else ("Tab: Planning" if idx == 1 else "Tab: Dashboard"))
+
+    def _seconds_to_hhmm(self, seconds: int) -> str:
+        return minutes_to_hhmm(int(max(0, seconds)) // 60)
+
+    def _dashboard_health_snapshot(self) -> dict[str, str]:
+        main_path = self.store.path
+        bak_path = f"{main_path}.bak"
+        backups_dir = os.path.join(os.path.dirname(main_path), "_backups")
+
+        def _fmt_ts(path: str) -> str:
+            try:
+                ts = os.path.getmtime(path)
+                return datetime.fromtimestamp(ts).strftime("%d-%m-%Y %H:%M")
+            except Exception:
+                return "onbekend"
+
+        snapshots = []
+        if os.path.isdir(backups_dir):
+            try:
+                base = os.path.splitext(os.path.basename(main_path))[0].lower() + "_"
+                snapshots = [p for p in os.listdir(backups_dir) if p.lower().startswith(base) and p.lower().endswith(".xlsx")]
+            except Exception:
+                snapshots = []
+        snap_count = len(snapshots)
+        status = "Gezond"
+        if not os.path.exists(main_path):
+            status = "Fout: hoofdbestand ontbreekt"
+        elif not os.path.exists(bak_path):
+            status = "Waarschuwing: .bak ontbreekt"
+        elif snap_count == 0:
+            status = "Waarschuwing: nog geen snapshots"
+
+        return {
+            "save": _fmt_ts(main_path),
+            "backup": _fmt_ts(bak_path),
+            "snapshots": str(snap_count),
+            "status": status,
+        }
+
+    def on_dashboard_period_changed(self, _idx: int):
+        today = date.today()
+        mode = self.dash_period.currentText() if hasattr(self, "dash_period") else "Huidige maand"
+        if mode == "Laatste 30 dagen":
+            start, end = today - timedelta(days=29), today
+        elif mode == "Dit jaar":
+            start, end = date(self.year, 1, 1), date(self.year, 12, 31)
+        elif mode == "Aangepast":
+            return
+        else:
+            start = date(today.year, today.month, 1)
+            end = date(today.year, today.month, calendar.monthrange(today.year, today.month)[1])
+        if hasattr(self, "dash_from"):
+            self.dash_from.setText(start.strftime("%d-%m-%Y"))
+        if hasattr(self, "dash_to"):
+            self.dash_to.setText(end.strftime("%d-%m-%Y"))
+        self.refresh_dashboard()
+
+    def _dashboard_date_range(self) -> tuple[date, date]:
+        today = date.today()
+        start_txt = self.dash_from.text().strip() if hasattr(self, "dash_from") else ""
+        end_txt = self.dash_to.text().strip() if hasattr(self, "dash_to") else ""
+        start = parse_nl_date(start_txt) if start_txt else None
+        end = parse_nl_date(end_txt) if end_txt else None
+        if start and end:
+            if start <= end:
+                return start, end
+            return end, start
+        if start and not end:
+            return start, today
+        if end and not start:
+            return date(end.year, 1, 1), end
+        start = date(today.year, today.month, 1)
+        end = date(today.year, today.month, calendar.monthrange(today.year, today.month)[1])
+        return start, end
+
+    def refresh_dashboard(self):
+        if not hasattr(self, "tile_mix"):
+            return
+        # Dashboard haalt brondata uit data_log (werk/idle/call) en combineert die met planning/budgetdata.
+        # Hierdoor krijg je in één scherm zowel operationele tijdsbesteding als planningscontext.
+        start, end = self._dashboard_date_range()
+        include_weekend = bool(self.dash_include_weekend.isChecked())
+
+        rows: list[tuple[date, int, int, int]] = []
+        for k, v in self.store.data_log.items():
+            dt = normalize_to_date(k)
+            if not dt:
+                continue
+            if dt < start or dt > end:
+                continue
+            if (not include_weekend) and dt.weekday() >= 5:
+                continue
+            rows.append((dt, int(v.get("work", 0)), int(v.get("idle", 0)), int(v.get("call", 0))))
+        rows.sort(key=lambda x: x[0])
+
+        rows_with_plan: list[tuple[date, int, int, int, int, int]] = []
+        for dt, w_s, i_s, c_s in rows:
+            planned_min = hhmm_to_minutes(self.store.get_day(dt).w)
+            worked_min = int(max(0, w_s) // 60)
+            delta_min = worked_min - planned_min
+            rows_with_plan.append((dt, planned_min, worked_min, delta_min, i_s, c_s))
+
+        total_work = sum(r[1] for r in rows)
+        total_idle = sum(r[2] for r in rows)
+        total_call = sum(r[3] for r in rows)
+        planned_sel = self.store.planned_work_minutes_between(start, end)
+        total_all = max(1, total_work + total_idle + total_call)
+        active_days = len(rows)
+        avg_work = int(total_work / active_days) if active_days else 0
+        prod_ratio = int(round((total_work / total_all) * 100))
+        total_variance_min = sum(r[3] for r in rows_with_plan)
+        over_plan_min = sum(max(0, r[3]) for r in rows_with_plan)
+        under_plan_min = sum(max(0, -r[3]) for r in rows_with_plan)
+        on_target_days = sum(1 for r in rows_with_plan if r[3] == 0)
+        budget = self.store.get_budget_overview()
+        vacation_left_total = budget["vacation_stat_left"] + budget["vacation_extra_left"]
+
+        self.lbl_dash_work.setText(f"Totaal gewerkt: {self._seconds_to_hhmm(total_work)}")
+        self.lbl_dash_planned.setText(f"Totaal gepland: {minutes_to_hhmm(planned_sel)}")
+        self.lbl_dash_idle.setText(f"Totaal pauze: {self._seconds_to_hhmm(total_idle)}")
+        self.lbl_dash_call.setText(f"Totaal call: {self._seconds_to_hhmm(total_call)}")
+        self.lbl_dash_ratio.setText(f"Productief ratio: {prod_ratio}%")
+        self.lbl_dash_days.setText(f"Actieve dagen: {active_days}")
+        self.lbl_dash_avg.setText(f"Gemiddeld/dag: {self._seconds_to_hhmm(avg_work)}")
+        sign = "+" if total_variance_min >= 0 else "-"
+        self.lbl_dash_variance.setText(
+            f"Afwijking gepland vs gewerkt: {sign}{minutes_to_hhmm(abs(total_variance_min))}"
+        )
+        self.lbl_dash_budget.setText(
+            f"Contract/week: {format_hours_int(budget['contract_week'])}u | "
+            f"Nog te plannen jaar: {format_hours_int(budget['to_plan_year'])}u | "
+            f"Vrij over: {format_hours_int(vacation_left_total)}u"
+        )
+
+        health = self._dashboard_health_snapshot()
+        self.lbl_health_save.setText(f"Laatste save: {health['save']}")
+        self.lbl_health_backup.setText(f"Laatste backup: {health['backup']}")
+        self.lbl_health_snapshots.setText(f"Snapshots: {health['snapshots']}")
+        self.lbl_health_status.setText(f"Status: {health['status']}")
+        if health["status"].startswith("Gezond"):
+            self.lbl_health_status.setStyleSheet("color:#86d29b;")
+        elif health["status"].startswith("Waarschuwing"):
+            self.lbl_health_status.setStyleSheet("color:#f3c27a;")
+        else:
+            self.lbl_health_status.setStyleSheet("color:#ff9492;")
+
+        self.tile_mix.set_data(
+            [("Werk", total_work, "#3f6ea6"), ("Pauze", total_idle, "#b38e52"), ("Call", total_call, "#b4535a")],
+            f"{prod_ratio}%",
+            "Aandeel per categorie in de hele selectie.",
+        )
+        on_target_min = sum(min(r[1], r[2]) for r in rows_with_plan)
+        self.tile_mix2.set_data(
+            [
+                ("Op schema", on_target_min, "#4e7fba"),
+                ("Boven planning", over_plan_min, "#4e9d6d"),
+                ("Onder planning", under_plan_min, "#b86a62"),
+            ],
+            f"{on_target_days} dagen",
+            "Balans tussen planning en realisatie over de gekozen periode.",
+        )
+        self.tile_cat.set_data(
+            [
+                ("Boven planning", over_plan_min, "#4e9d6d"),
+                ("Onder planning", under_plan_min, "#b86a62"),
+                ("Op schema (dagen)", on_target_days, "#4e7fba"),
+            ],
+            f"Totale afwijking: {sign}{minutes_to_hhmm(abs(total_variance_min))}",
+        )
+
+        self.dash_table.setRowCount(0)
+        # Detailset toont de grootste plan-werk afwijkingen voor snelle bijsturing.
+        for dt, planned_m, worked_m, delta_m, i_s, c_s in sorted(rows_with_plan, key=lambda x: abs(x[3]), reverse=True)[:10]:
+            r = self.dash_table.rowCount()
+            self.dash_table.insertRow(r)
+            self.dash_table.setItem(r, 0, QTableWidgetItem(dt.strftime("%d-%m-%Y")))
+            self.dash_table.setItem(r, 1, QTableWidgetItem(minutes_to_hhmm(planned_m)))
+            self.dash_table.setItem(r, 2, QTableWidgetItem(minutes_to_hhmm(worked_m)))
+            d_sign = "+" if delta_m >= 0 else "-"
+            self.dash_table.setItem(r, 3, QTableWidgetItem(f"{d_sign}{minutes_to_hhmm(abs(delta_m))}"))
+            self.dash_table.setItem(r, 4, QTableWidgetItem(self._seconds_to_hhmm(i_s)))
+            self.dash_table.setItem(r, 5, QTableWidgetItem(self._seconds_to_hhmm(c_s)))
 
     def edit_day(self, dt: date):
-        if self.mode != "planned":
-            return
         existing_reason = self.store.day_reason(dt)
+        allow_tvt = self.store.get_saldo_minutes() > 0
         dlg = DayEditDialog(
             self,
             dt,
@@ -2960,6 +5794,8 @@ class MainWindow(QMainWindow):
             self.store.get_extra_info(dt),
             self.extra_info_enabled,
             self.extra_info_colors,
+            free_budget_text=self.store.get_vacation_budget_text(),
+            allow_tvt=allow_tvt,
         )
         if dlg.exec() != QDialog.Accepted or not dlg.data_out:
             return
@@ -2974,6 +5810,96 @@ class MainWindow(QMainWindow):
             self.refresh_all()
             self.lbl_status.setText("Werkpatroon opgeslagen")
 
+    def open_bulk_planning(self, start_date: date | None = None, end_date: date | None = None):
+        if not isinstance(start_date, date):
+            start_date = None
+        if not isinstance(end_date, date):
+            end_date = None
+        allow_tvt = self.store.get_saldo_minutes() > 0
+        weekday_limits = [
+            hhmm_to_minutes(normalize_hhmm(self.store.weekday_pattern.get(i, {}).get("M", "08:00"), "08:00"))
+            for i in range(7)
+        ]
+        dlg = BulkPlanningDialog(
+            self,
+            self.year,
+            self.extra_info_enabled,
+            allow_tvt=allow_tvt,
+            start_date=start_date,
+            end_date=end_date,
+            weekday_limits=weekday_limits,
+        )
+        if dlg.exec() != QDialog.Accepted or not dlg.result_data:
+            return
+        data = dlg.result_data
+        d_from: date = data["start"]
+        d_to: date = data["end"]
+        skip_weekend = bool(data["skip_weekend"])
+        skip_holiday = bool(data["skip_holiday"])
+        rows_cfg = {int(r.get("weekday", -1)): r for r in (data.get("rows_cfg") or [])}
+
+        changed = 0
+        skipped = 0
+        clamped = 0
+
+        for dt in daterange(d_from, d_to):
+            if dt.year != self.year:
+                skipped += 1
+                continue
+            cfg = rows_cfg.get(dt.weekday())
+            if not cfg or not bool(cfg.get("active")):
+                continue
+            if skip_weekend and dt.weekday() >= 5:
+                continue
+            if skip_holiday and dt in self.store.nl_holidays:
+                continue
+
+            cur = self.store.get_day(dt)
+            day_limit = self.store.get_day_limit(dt)
+            if day_limit <= 0:
+                skipped += 1
+                continue
+
+            target_w = hhmm_to_minutes(str(cfg.get("work_hours", "00:00")))
+            target_v = hhmm_to_minutes(str(cfg.get("free_hours", "00:00")))
+
+            # Dagmax uit werkpatroon is leidend. Bij overschrijding reduceren we eerst werk,
+            # zodat ingepland vrij zo veel mogelijk behouden blijft.
+            effective_limit = max(0, day_limit - hhmm_to_minutes(cur.z))
+            overflow = max(0, (target_w + target_v) - effective_limit)
+            if overflow > 0:
+                cut_w = min(target_w, overflow)
+                target_w -= cut_w
+                overflow -= cut_w
+                if overflow > 0:
+                    target_v = max(0, target_v - overflow)
+                clamped += 1
+
+            wd_name = WEEKDAY_NAMES_NL[dt.weekday()]
+            reason_tpl = str(cfg.get("reason_tpl", "") or "").strip()
+            reason = reason_tpl.replace("{datum}", dt.strftime("%d-%m-%Y")).replace("{weekdag}", wd_name) if reason_tpl else ""
+            out = DayData(
+                w=minutes_to_hhmm(max(0, target_w)),
+                v=minutes_to_hhmm(max(0, target_v)),
+                z=cur.z,
+                worked=cur.worked,
+            )
+            current_extra = self.store.get_extra_info(dt)
+            extra_mode = str(cfg.get("extra_mode", "(ongewijzigd)")).strip()
+            if extra_mode == "(ongewijzigd)":
+                new_extra = current_extra
+            elif extra_mode == "(leegmaken)":
+                new_extra = ""
+            else:
+                new_extra = extra_mode
+            self.store.set_day(dt, out, reason, new_extra)
+            changed += 1
+
+        self.refresh_all()
+        self.lbl_status.setText(
+            f"Bulk planning: {changed} dagen aangepast, {skipped} overgeslagen, {clamped} afgekapt op dagmax"
+        )
+
     def open_extra_info_settings(self):
         dlg = ExtraInfoSettingsDialog(self, self.store.extra_info_options, self.extra_info_enabled)
         if dlg.exec() != QDialog.Accepted:
@@ -2986,6 +5912,33 @@ class MainWindow(QMainWindow):
         self.refresh_all()
         self.lbl_status.setText("Aanvullende info opties opgeslagen")
 
+    def open_contract_budget_settings(self):
+        dlg = ContractBudgetDialog(
+            self,
+            self.store.employment_pct,
+            self.store.fulltime_week_minutes,
+            self.store.contract_year_minutes,
+            self.store.vacation_stat_minutes,
+            self.store.vacation_extra_minutes,
+            self.store.carry_hours_prev_minutes,
+            self.store.carry_vac_prev_minutes,
+            self.store.workdays_mask,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.store.save_contract_budget_settings(
+            dlg.employment_pct,
+            dlg.fulltime_week,
+            dlg.contract_year,
+            dlg.vacation_stat,
+            dlg.vacation_extra,
+            dlg.carry_hours_prev,
+            dlg.carry_vac_prev,
+            dlg.workdays_mask,
+        )
+        self.refresh_all()
+        self.lbl_status.setText("Contract- en vakantiebudget opgeslagen")
+
     def open_school_region_settings(self):
         dlg = SchoolRegionDialog(self, self.school_region)
         if dlg.exec() != QDialog.Accepted:
@@ -2996,21 +5949,53 @@ class MainWindow(QMainWindow):
         if not self.store.school_vakanties:
             added = self.store.seed_school_holidays_from_api(region_filter=None)
             if added:
-                self.store.wb.save(self.store.path)
+                self.store.safe_save()
                 self.store.load_school_holidays()
         self.save_color_settings()
         self.refresh_all()
         self.lbl_status.setText(f"Schoolvakantie regio: {self.school_region}")
 
     def open_timer_settings(self):
-        dlg = TimerSettingsDialog(self, self.idle_threshold_sec)
+        dlg = TimerSettingsDialog(
+            self,
+            self.idle_threshold_sec,
+            self.include_lockscreen_idle,
+            self.include_sleep_idle,
+        )
         if dlg.exec() != QDialog.Accepted:
             return
         self.idle_threshold_sec = dlg.idle_threshold_sec
+        self.include_lockscreen_idle = bool(dlg.include_lockscreen_idle)
+        self.include_sleep_idle = bool(dlg.include_sleep_idle)
         if self.timer_host and hasattr(self.timer_host, "panel"):
             self.timer_host.panel.set_idle_threshold(self.idle_threshold_sec)
+            self.timer_host.panel.set_idle_policy(self.include_lockscreen_idle, self.include_sleep_idle)
         self.save_color_settings()
-        self.lbl_status.setText(f"Idle detectie: {self.idle_threshold_sec // 60:02d}:{self.idle_threshold_sec % 60:02d}")
+        self.lbl_status.setText(
+            f"Pauze-detectie: {self.idle_threshold_sec // 60} min | "
+            f"lockscreen {'aan' if self.include_lockscreen_idle else 'uit'} | "
+            f"sleep {'aan' if self.include_sleep_idle else 'uit'}"
+        )
+
+    def on_timer_enabled_toggled(self, checked: bool):
+        self.timer_enabled = bool(checked)
+        if self.timer_host and hasattr(self.timer_host, "panel"):
+            self.timer_host.panel.set_tracking_enabled(self.timer_enabled)
+        if not self.timer_enabled:
+            if self.timer_host:
+                self.timer_host.disable_timer_ui()
+                self.timer_host = None
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        else:
+            if self.timer_host is None:
+                timer = TimerWindow(self)
+                self.timer_host = timer
+                self.hide()
+                timer.show()
+        self.save_color_settings()
+        self.lbl_status.setText("Timer meten: aan" if self.timer_enabled else "Timer meten: uit")
 
     def open_glass_settings(self):
         dlg = GlassSettingsDialog(self, self.inactive_glass_opacity)
@@ -3023,11 +6008,11 @@ class MainWindow(QMainWindow):
             self.timer_host.update_focus_glass()
         self.save_color_settings()
         self.lbl_status.setText(
-            f"Glassmorphism: {int(round(self.inactive_glass_opacity * 100)):02d}% (vast min {int(GLASS_OPACITY_MIN * 100)}% / max {int(GLASS_OPACITY_MAX * 100)}%)"
+            f"Doorzichtigheid: {int(round(self.inactive_glass_opacity * 100)):02d}% (vast min {int(GLASS_OPACITY_MIN * 100)}% / max {int(GLASS_OPACITY_MAX * 100)}%)"
         )
 
     def save(self):
-        self.store.wb.save(self.store.path)
+        self.store.safe_save()
         self.lbl_status.setText("Opgeslagen")
         self.lbl_saldo.setText(self.store.get_saldo_text())
 
@@ -3040,8 +6025,10 @@ class MainWindow(QMainWindow):
         t = date.today()
         if t.year != self.year:
             return
-        self.tabs.setCurrentIndex(1)
-        self.month_tabbar.setCurrentIndex(t.month - 1)
+        self.worked_month_tabbar.setCurrentIndex(t.month)
+        self.planned_month_tabbar.setCurrentIndex(t.month)
+        if self.tabs.currentIndex() == 2:
+            self.tabs.setCurrentIndex(0)
 
     def apply_pattern_year(self, start_date: date | None = None, end_date: date | None = None):
         ws = self.store.wb["Planning"]
@@ -3089,7 +6076,7 @@ class MainWindow(QMainWindow):
             ws_vrij.delete_rows(r, 1)
 
         self.store.load_free_days()
-        self.store.wb.save(self.store.path)
+        self.store.safe_save()
         self.refresh_all()
         self.lbl_status.setText("Werkpatroon toegepast")
         if start_date and end_date:
@@ -3099,6 +6086,23 @@ class MainWindow(QMainWindow):
 
     def colors_path(self) -> str:
         return os.path.join(self.base_dir, "calendar_colors.json")
+
+    def color_settings_candidates(self) -> list[str]:
+        """Zoekvolgorde voor kleurinstellingen.
+
+        Primair lezen we naast het script. Als fallback proberen we de lokale
+        Downloads-map, zodat bestaande gebruikersinstellingen niet kwijt lijken
+        wanneer het script vanaf een andere map wordt gestart.
+        """
+        primary = self.colors_path()
+        out = [primary]
+        try:
+            downloads = os.path.join(os.path.expanduser("~"), "Downloads", "calendar_colors.json")
+            if downloads not in out:
+                out.append(downloads)
+        except Exception:
+            pass
+        return out
 
     def ensure_extra_info_enabled(self):
         self.extra_info_enabled = normalize_extra_info_enabled(self.store.extra_info_options, self.extra_info_enabled)
@@ -3113,31 +6117,59 @@ class MainWindow(QMainWindow):
             if opt not in self.extra_info_colors:
                 self.extra_info_colors[opt] = default_extra_info_color(opt)
 
-    def load_color_settings(self) -> tuple[dict[str, str], dict[str, str], int, list[str], str, float, float, float]:
-        cfg = dict(COLOR_DEFAULTS)
+    def load_color_settings(self) -> tuple[dict[str, str], dict[str, str], dict[str, str], int, bool, bool, list[str], str, float, float, float, bool]:
+        worked_cfg = dict(WORKED_COLOR_DEFAULTS)
+        planned_cfg = dict(PLANNED_COLOR_DEFAULTS)
         extra_cfg: dict[str, str] = {}
         idle_threshold_sec = 60
+        include_lockscreen_idle = True
+        include_sleep_idle = False
         extra_enabled: list[str] = []
         school_region = "zuid"
         inactive_glass_opacity = 0.72
         min_inactive_glass_opacity = GLASS_OPACITY_MIN
         max_inactive_glass_opacity = GLASS_OPACITY_MAX
-        p = self.colors_path()
-        if os.path.exists(p):
+        timer_enabled = True
+        p = ""
+        for candidate in self.color_settings_candidates():
+            if os.path.exists(candidate):
+                p = candidate
+                break
+        if p:
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    source_colors = data.get("colors") if isinstance(data.get("colors"), dict) else data
-                    for k, v in source_colors.items():
-                        if k in cfg and isinstance(v, str) and v.startswith("#"):
-                            cfg[k] = v
+                    if isinstance(data.get("worked_colors"), dict) or isinstance(data.get("planned_colors"), dict):
+                        source_worked = data.get("worked_colors") if isinstance(data.get("worked_colors"), dict) else {}
+                        source_planned = data.get("planned_colors") if isinstance(data.get("planned_colors"), dict) else {}
+                        # Als 1 van beide ontbreekt, mirroren we de aanwezige set.
+                        if not source_worked and source_planned:
+                            source_worked = dict(source_planned)
+                        if not source_planned and source_worked:
+                            source_planned = dict(source_worked)
+                        for k, v in source_worked.items():
+                            if k in worked_cfg and isinstance(v, str) and v.startswith("#"):
+                                worked_cfg[k] = v
+                        for k, v in source_planned.items():
+                            if k in planned_cfg and isinstance(v, str) and v.startswith("#"):
+                                planned_cfg[k] = v
+                    else:
+                        source_colors = data.get("colors") if isinstance(data.get("colors"), dict) else data
+                        for k, v in source_colors.items():
+                            if isinstance(v, str) and v.startswith("#") and k in planned_cfg:
+                                planned_cfg[k] = v
+                                worked_cfg[k] = v
                     source_extra = data.get("extra_info_colors") if isinstance(data.get("extra_info_colors"), dict) else {}
                     for k, v in source_extra.items():
                         if isinstance(k, str) and isinstance(v, str) and v.startswith("#"):
                             extra_cfg[k.strip()] = v
                     if isinstance(data.get("idle_threshold_sec"), int):
                         idle_threshold_sec = max(15, min(3600, int(data.get("idle_threshold_sec"))))
+                    if isinstance(data.get("include_lockscreen_idle"), bool):
+                        include_lockscreen_idle = bool(data.get("include_lockscreen_idle"))
+                    if isinstance(data.get("include_sleep_idle"), bool):
+                        include_sleep_idle = bool(data.get("include_sleep_idle"))
                     src_enabled = data.get("extra_info_enabled")
                     if isinstance(src_enabled, list):
                         extra_enabled = [str(x).strip() for x in src_enabled if str(x).strip()]
@@ -3146,17 +6178,23 @@ class MainWindow(QMainWindow):
                         school_region = sr
                     if isinstance(data.get("inactive_glass_opacity"), (int, float)):
                         inactive_glass_opacity = max(GLASS_OPACITY_MIN, min(GLASS_OPACITY_MAX, float(data.get("inactive_glass_opacity"))))
+                    if isinstance(data.get("timer_enabled"), bool):
+                        timer_enabled = bool(data.get("timer_enabled"))
             except:
                 pass
         return (
-            cfg,
+            worked_cfg,
+            planned_cfg,
             extra_cfg,
             idle_threshold_sec,
+            include_lockscreen_idle,
+            include_sleep_idle,
             extra_enabled,
             school_region,
             inactive_glass_opacity,
             min_inactive_glass_opacity,
             max_inactive_glass_opacity,
+            timer_enabled,
         )
 
     def save_color_settings(self):
@@ -3164,12 +6202,16 @@ class MainWindow(QMainWindow):
             with open(self.colors_path(), "w", encoding="utf-8") as f:
                 json.dump(
                     {
-                        "colors": self.colors,
+                        "worked_colors": self.worked_colors,
+                        "planned_colors": self.planned_colors,
                         "extra_info_colors": self.extra_info_colors,
                         "idle_threshold_sec": int(self.idle_threshold_sec),
+                        "include_lockscreen_idle": bool(self.include_lockscreen_idle),
+                        "include_sleep_idle": bool(self.include_sleep_idle),
                         "extra_info_enabled": list(self.extra_info_enabled),
                         "school_region": self.school_region,
                         "inactive_glass_opacity": float(self.inactive_glass_opacity),
+                        "timer_enabled": bool(self.timer_enabled),
                     },
                     f,
                     indent=2,
@@ -3181,12 +6223,13 @@ class MainWindow(QMainWindow):
         self.ensure_extra_info_colors()
         dlg = ColorSettingsDialog(
             self,
-            self.colors,
+            self.planned_colors,
             self.store.extra_info_options,
             self.extra_info_colors,
         )
         if dlg.exec() == QDialog.Accepted:
-            self.colors = dict(dlg.colors)
+            self.planned_colors = dict(dlg.colors)
+            self.worked_colors = dict(self.planned_colors)
             self.extra_info_colors = dict(dlg.extra_info_colors)
             self.ensure_extra_info_colors()
             self.save_color_settings()
@@ -3194,7 +6237,8 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Kleuren bijgewerkt")
 
     def reset_color_settings(self):
-        self.colors = dict(COLOR_DEFAULTS)
+        self.worked_colors = dict(WORKED_COLOR_DEFAULTS)
+        self.planned_colors = dict(PLANNED_COLOR_DEFAULTS)
         self.extra_info_colors = {}
         self.ensure_extra_info_colors()
         self.save_color_settings()
@@ -3202,7 +6246,17 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("Kleuren hersteld")
 
     def about(self):
-        QMessageBox.information(self, "Over", "Tijdplanner Pro (PySide6)\nLuxe desktop UI met tabs, menu, toolbar en snelle tabellen.")
+        QMessageBox.information(
+            self,
+            "Over",
+            (
+                "Tijdplanner Pro (PySide6)\n"
+                f"Versie: {APP_VERSION}\n"
+                f"Auteur: {APP_AUTHOR}\n"
+                f"Laatste update: {APP_LAST_UPDATE}\n\n"
+                "Roadmap: migratie van Excel-opslag naar SQLite."
+            ),
+        )
 
     def toggle_maximize_restore(self):
         if self.isMaximized():
@@ -3211,19 +6265,19 @@ class MainWindow(QMainWindow):
             self.showMaximized()
 
     def eventFilter(self, obj, event):
-        if hasattr(self, "month_tabbar") and obj in {
-            self.month_tabbar,
-            getattr(self, "month_board", None),
-            getattr(getattr(self, "month_board", None), "scroll", None),
-            getattr(getattr(self, "month_board", None), "host", None),
-        } and event.type() == QEvent.Wheel:
-            delta = event.angleDelta().y()
-            idx = self.month_tabbar.currentIndex()
-            if delta < 0 and idx < self.month_tabbar.count() - 1:
-                self.month_tabbar.setCurrentIndex(idx + 1)
-            elif delta > 0 and idx > 0:
-                self.month_tabbar.setCurrentIndex(idx - 1)
-            return True
+        if hasattr(self, "worked_month_tabbar") and event.type() == QEvent.Wheel:
+            # Wheel->maandwissel mag alleen op de maand-tabbars zelf gebeuren.
+            # In jaar/maandweergaven wil de gebruiker normaal verticaal kunnen scrollen door content;
+            # daarom kapen we het wheel-event buiten de tabbar niet meer af.
+            if obj in {self.worked_month_tabbar, self.planned_month_tabbar}:
+                tabbar = self.worked_month_tabbar if obj == self.worked_month_tabbar else self.planned_month_tabbar
+                delta = event.angleDelta().y()
+                idx = tabbar.currentIndex()
+                if delta < 0 and idx < tabbar.count() - 1:
+                    tabbar.setCurrentIndex(idx + 1)
+                elif delta > 0 and idx > 0:
+                    tabbar.setCurrentIndex(idx - 1)
+                return True
 
         if obj == self.menuBar():
             menu_popup_open = any(m.isVisible() for m in self.menuBar().findChildren(QMenu))
@@ -3275,13 +6329,68 @@ class MainWindow(QMainWindow):
         self.close()
 
 
+# ============================================================================
+# TIMER SHELL + SYSTEM TRAY
+# TimerWindow host het compacte paneel en regelt tray-interacties.
+# Het venster is los van MainWindow zodat gebruikers snel kunnen wisselen
+# tussen een minimalistische timer-flow en volledige planner-bediening.
+# ============================================================================
+class WindowsSessionEventFilter(QAbstractNativeEventFilter):
+    """Native Windows events voor lock/unlock en suspend/resume."""
+
+    WM_WTSSESSION_CHANGE = 0x02B1
+    WM_POWERBROADCAST = 0x0218
+    WTS_SESSION_LOCK = 0x0007
+    WTS_SESSION_UNLOCK = 0x0008
+    PBT_APMSUSPEND = 0x0004
+    PBT_APMRESUMEAUTOMATIC = 0x0012
+    PBT_APMRESUMESUSPEND = 0x0007
+
+    def __init__(self, on_lock=None, on_unlock=None, on_suspend=None, on_resume=None):
+        super().__init__()
+        self.on_lock = on_lock
+        self.on_unlock = on_unlock
+        self.on_suspend = on_suspend
+        self.on_resume = on_resume
+
+    def nativeEventFilter(self, event_type, message):
+        if sys.platform != "win32":
+            return False, 0
+        et = bytes(event_type).decode(errors="ignore") if isinstance(event_type, (bytes, bytearray)) else str(event_type)
+        if et not in {"windows_generic_MSG", "windows_dispatcher_MSG"}:
+            return False, 0
+        try:
+            msg = wintypes.MSG.from_address(int(message))
+        except Exception:
+            return False, 0
+
+        if msg.message == self.WM_WTSSESSION_CHANGE:
+            if msg.wParam == self.WTS_SESSION_LOCK and callable(self.on_lock):
+                self.on_lock()
+            elif msg.wParam == self.WTS_SESSION_UNLOCK and callable(self.on_unlock):
+                self.on_unlock()
+        elif msg.message == self.WM_POWERBROADCAST:
+            if msg.wParam == self.PBT_APMSUSPEND and callable(self.on_suspend):
+                self.on_suspend()
+            elif msg.wParam in {self.PBT_APMRESUMEAUTOMATIC, self.PBT_APMRESUMESUSPEND} and callable(self.on_resume):
+                self.on_resume()
+        return False, 0
+
+
 class TimerWindow(QWidget):
-    """Los timer-venster dat de planner in/uit laat schuiven."""
+    """Los timer-venster dat de planner in/uit laat schuiven.
+
+    Dit venster is de lichte shell rond TimerPanel en system tray gedrag.
+    De planner blijft separaat zodat de gebruiker kan kiezen tussen compacte
+    timer-focus en een volledig plan-/dashboardvenster.
+    """
 
     def __init__(self, planner: MainWindow):
         super().__init__()
         self.planner = planner
         self._force_quit = False
+        self._native_filter = None
+        self._wts_registered = False
         self.setObjectName("timerWindow")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -3302,22 +6411,36 @@ class TimerWindow(QWidget):
         )
         self.panel.set_glass_limits(self.planner.min_inactive_glass_opacity, self.planner.max_inactive_glass_opacity)
         self.panel.set_glass_opacity(self.planner.inactive_glass_opacity)
-        self.panel.apply_colors(self.planner.colors)
+        self.panel.apply_colors(self.planner.active_colors())
+        self.panel.set_idle_policy(self.planner.include_lockscreen_idle, self.planner.include_sleep_idle)
+        self.panel.set_tracking_enabled(self.planner.timer_enabled)
         self.panel.height_changed.connect(self.on_panel_height_changed)
         self.panel.timer.timeout.connect(self.update_tray_visual)
         root.addWidget(self.panel)
         self.on_panel_height_changed(self.panel.maximumHeight())
+        self.move(self._initial_timer_position())
         self.setup_tray()
         app = QApplication.instance()
         if app is not None and hasattr(app, "applicationStateChanged"):
             app.applicationStateChanged.connect(lambda _state: self.update_focus_glass())
         self.update_focus_glass()
+        self._register_system_event_hooks()
 
     def on_panel_height_changed(self, height: int):
         self.setFixedSize(self.panel.maximumWidth(), max(56, height))
 
     def move_window_by(self, delta: QPoint):
         self.move(self.pos() + delta)
+
+    def _initial_timer_position(self) -> QPoint:
+        # Start linksboven met marge zodat de timer zichtbaar maar niet "in de hoek geplakt" staat.
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 2560, 1440)
+        margin_x = 18
+        margin_y = 26
+        x = max(avail.left(), avail.left() + margin_x)
+        y = max(avail.top(), avail.top() + margin_y)
+        return QPoint(x, y)
 
     def update_focus_glass(self):
         app = QApplication.instance()
@@ -3327,6 +6450,63 @@ class TimerWindow(QWidget):
         if self.planner.isVisible():
             planner_opacity = min(0.98, self.planner.inactive_glass_opacity + 0.08)
             self.planner.setWindowOpacity(1.0 if app_active else planner_opacity)
+
+    def _register_system_event_hooks(self):
+        if sys.platform != "win32":
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        if self._native_filter is None:
+            self._native_filter = WindowsSessionEventFilter(
+                on_lock=self._on_session_lock,
+                on_unlock=self._on_session_unlock,
+                on_suspend=self._on_system_suspend,
+                on_resume=self._on_system_resume,
+            )
+            app.installNativeEventFilter(self._native_filter)
+        try:
+            hwnd = int(self.winId())
+            rc = ctypes.windll.wtsapi32.WTSRegisterSessionNotification(wintypes.HWND(hwnd), 0)
+            self._wts_registered = bool(rc)
+        except Exception:
+            self._wts_registered = False
+
+    def _unregister_system_event_hooks(self):
+        app = QApplication.instance()
+        if sys.platform == "win32" and self._wts_registered:
+            try:
+                hwnd = int(self.winId())
+                ctypes.windll.wtsapi32.WTSUnRegisterSessionNotification(wintypes.HWND(hwnd))
+            except Exception:
+                pass
+            self._wts_registered = False
+        if app is not None and self._native_filter is not None:
+            try:
+                app.removeNativeEventFilter(self._native_filter)
+            except Exception:
+                pass
+            self._native_filter = None
+
+    def _on_session_lock(self):
+        self.panel.set_os_context(locked=True)
+        if hasattr(self.planner, "lbl_status"):
+            self.planner.lbl_status.setText("Sessie vergrendeld: idle-detectie loopt door")
+
+    def _on_session_unlock(self):
+        self.panel.set_os_context(locked=False)
+        if hasattr(self.planner, "lbl_status"):
+            self.planner.lbl_status.setText("Sessie ontgrendeld: idle-detectie actief")
+
+    def _on_system_suspend(self):
+        self.panel.set_os_context(sleeping=True)
+        if hasattr(self.planner, "lbl_status"):
+            self.planner.lbl_status.setText("Systeem in slaapstand: timerdetectie tijdelijk onderdrukt")
+
+    def _on_system_resume(self):
+        self.panel.set_os_context(sleeping=False)
+        if hasattr(self.planner, "lbl_status"):
+            self.planner.lbl_status.setText("Systeem actief: timerdetectie hervat")
 
     def _planner_target_near_timer(self, timer_geo: QRect) -> QRect:
         target = QRect(self.planner._planner_target_geometry)
@@ -3461,52 +6641,7 @@ class TimerWindow(QWidget):
         self.update_tray_visual()
 
     def make_tray_icon(self, running: bool, work_seconds: int, idle_seconds: int) -> QIcon:
-        pm = QPixmap(64, 64)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-
-        grad = QLinearGradient(0, 0, 64, 64)
-        if running:
-            grad.setColorAt(0.0, QColor("#1ea672"))
-            grad.setColorAt(1.0, QColor("#2563eb"))
-        else:
-            grad.setColorAt(0.0, QColor("#6b7280"))
-            grad.setColorAt(1.0, QColor("#374151"))
-        p.setBrush(grad)
-        p.setPen(QPen(QColor("#dff7ff"), 2))
-        p.drawRoundedRect(6, 6, 52, 52, 14, 14)
-
-        # Buitenring voor "actief/idle"-gevoel.
-        p.setBrush(Qt.NoBrush)
-        ring_color = QColor("#facc15") if idle_seconds > 0 and running else QColor("#ecfeff")
-        p.setPen(QPen(ring_color, 3))
-        p.drawEllipse(12, 12, 40, 40)
-
-        # Seconde-progressie binnen de minuut.
-        sec = int(work_seconds) % 60
-        arc_span = int((sec / 60.0) * 360 * 16)
-        p.setPen(QPen(QColor("#ffffff"), 3))
-        p.drawArc(12, 12, 40, 40, 90 * 16, -arc_span)
-
-        # Mini timer-tekst (minuten, capped).
-        mins = min(999, int(work_seconds) // 60)
-        txt = f"{mins:02d}" if mins < 100 else "99+"
-        p.setPen(QPen(QColor("#f8fafc"), 1))
-        p.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        p.drawText(pm.rect(), Qt.AlignCenter, txt)
-
-        # Run/pause-indicator onderaan.
-        p.setBrush(QColor("#f8fafc"))
-        p.setPen(QPen(QColor("#f8fafc"), 1))
-        if running:
-            p.setFont(QFont("Segoe UI Symbol", 8, QFont.Bold))
-            p.drawText(QRect(44, 49, 14, 11), Qt.AlignCenter, "▶")
-        else:
-            p.drawRect(45, 50, 2, 8)
-            p.drawRect(50, 50, 2, 8)
-        p.end()
-        return QIcon(pm)
+        return build_status_icon(running=running, work_seconds=work_seconds, idle_seconds=idle_seconds)
 
     def update_tray_visual(self):
         running = bool(self.panel.running)
@@ -3528,7 +6663,7 @@ class TimerWindow(QWidget):
         self.tray.setToolTip(
             f"Tijdplanner Pro ({state})\n"
             f"Werk: {seconds_to_hhmmss(w)}\n"
-            f"Idle: {seconds_to_hhmmss(i)}\n"
+            f"Pauze: {seconds_to_hhmmss(i)}\n"
             f"Call: {seconds_to_hhmmss(c)}"
         )
         if hasattr(self, "act_start"):
@@ -3556,14 +6691,27 @@ class TimerWindow(QWidget):
     def quit_all(self):
         self._force_quit = True
         self.panel.pause()
+        self._unregister_system_event_hooks()
         if self.tray:
             self.tray.hide()
         self.planner._allow_close = True
         self.planner.close()
         self.close()
 
+    def disable_timer_ui(self):
+        self._force_quit = True
+        self.panel.pause()
+        self._unregister_system_event_hooks()
+        if self.tray:
+            self.tray.hide()
+            self.tray.deleteLater()
+            self.tray = None
+        self.hide()
+        self.close()
+
     def closeEvent(self, event):
         if self._force_quit:
+            self._unregister_system_event_hooks()
             event.accept()
             return
         if self.tray and self.tray.isVisible():
@@ -3572,19 +6720,61 @@ class TimerWindow(QWidget):
             return
         event.accept()
 
+
+# ============================================================================
+# ENTRYPOINT
+# De startroute kiest afhankelijk van timer-instelling tussen compacte timerstart
+# of directe plannerstart. Hiermee blijft de opstartervaring voorspelbaar voor
+# beide gebruiksscenario's.
+# ============================================================================
 def main():
+    """Applicatie-entrypoint met timer-aan/uit route.
+
+    Start altijd MainWindow als centrale statehouder. Als timer actief is, wordt
+    eerst alleen het timer-venster getoond; anders start de planner direct zichtbaar.
+    """
+    set_windows_app_user_model_id()
     app = QApplication(sys.argv)
     app.setApplicationName("Tijdplanner Pro")
+    app.setWindowIcon(build_status_icon(running=True, work_seconds=0, idle_seconds=0))
+    if not acquire_single_instance_lock():
+        lock = QLockFile(os.path.join(tempfile.gettempdir(), "tijdplanner_pro.instance.lock"))
+        pid, _host, _app = lock.getLockInfo()
+        txt = "Tijdplanner Pro draait al."
+        if int(pid or 0) > 0:
+            txt += f"\nActieve sessie PID: {pid}"
+        txt += "\n\nWil je de bestaande sessie afsluiten en deze sessie starten?"
+        reply = QMessageBox.question(
+            None,
+            "Al actief",
+            txt,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if not try_takeover_existing_instance():
+            QMessageBox.warning(
+                None,
+                "Overnemen mislukt",
+                "Bestaande sessie kon niet afgesloten worden.\nSluit die eerst handmatig.",
+            )
+            return
     planner = MainWindow()
-    planner.hide()
-    timer = TimerWindow(planner)
-    planner.timer_host = timer
-    timer.show()
+    if planner.timer_enabled:
+        planner.hide()
+        timer = TimerWindow(planner)
+        planner.timer_host = timer
+        timer.show()
+    else:
+        planner.show()
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
