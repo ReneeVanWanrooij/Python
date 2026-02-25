@@ -926,11 +926,17 @@ def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
         # OneDrive/nieuwe werkplekken kunnen een pad doorgeven waarvan de map
         # nog niet fysiek bestaat; borg dat eerst om FileNotFound te voorkomen.
         os.makedirs(dir_path, exist_ok=True)
-        # Gebruik een echt temp-bestandspad in de doelmap. Dit is robuuster op
-        # enterprise omgevingen dan handmatig '<naam>.tmp' plakken.
-        fd, created_tmp = tempfile.mkstemp(prefix=f"{base_name}_", suffix=".tmp.xlsx", dir=dir_path)
-        os.close(fd)
-        tmp_path = created_tmp
+        # Probeer eerst een temp-bestand in de doelmap (atomisch replace-pad).
+        # Sommige enterprise OneDrive-profielen blokkeren dit onverwacht met
+        # FileNotFound; dan vallen we terug op %TEMP% en doen we daarna move/replace.
+        try:
+            fd, created_tmp = tempfile.mkstemp(prefix=f"{base_name}_", suffix=".tmp.xlsx", dir=dir_path)
+            os.close(fd)
+            tmp_path = created_tmp
+        except FileNotFoundError:
+            fd, created_tmp = tempfile.mkstemp(prefix=f"{base_name}_", suffix=".tmp.xlsx", dir=tempfile.gettempdir())
+            os.close(fd)
+            tmp_path = created_tmp
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         workbook.save(tmp_path)
@@ -961,7 +967,12 @@ def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
                             break
             except Exception:
                 pass
-        os.replace(tmp_path, path)
+        try:
+            os.replace(tmp_path, path)
+        except OSError:
+            # Fallback voor omgevingen waar cross-dir replace policy-technisch
+            # faalt: forceer via move.
+            shutil.move(tmp_path, path)
     except PermissionError as exc:
         raise RuntimeError(
             "Opslaan mislukt: het Excel-bestand lijkt in gebruik. Sluit het bestand en probeer opnieuw."
@@ -6860,7 +6871,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
