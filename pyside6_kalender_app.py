@@ -1,4 +1,4 @@
-﻿import calendar
+import calendar
 import hashlib
 import importlib
 import json
@@ -910,8 +910,9 @@ def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
     het doelbestand vervangen. Dat voorkomt dat een halve write het originele
     bestand direct beschadigt.
     """
-    dir_path = os.path.dirname(path) or "."
-    tmp_path = f"{path}.tmp"
+    dir_path = os.path.abspath(os.path.dirname(path) or ".")
+    base_name = os.path.splitext(os.path.basename(path))[0] or "workbook"
+    tmp_path = ""
     bak_path = f"{path}.bak"
     # Rotating snapshots beperken schade bij late detectie van bestandscorruptie.
     # We schrijven deze snapshots bewust beperkt in frequentie om save-latency laag te houden.
@@ -925,6 +926,11 @@ def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
         # OneDrive/nieuwe werkplekken kunnen een pad doorgeven waarvan de map
         # nog niet fysiek bestaat; borg dat eerst om FileNotFound te voorkomen.
         os.makedirs(dir_path, exist_ok=True)
+        # Gebruik een echt temp-bestandspad in de doelmap. Dit is robuuster op
+        # enterprise omgevingen dan handmatig '<naam>.tmp' plakken.
+        fd, created_tmp = tempfile.mkstemp(prefix=f"{base_name}_", suffix=".tmp.xlsx", dir=dir_path)
+        os.close(fd)
+        tmp_path = created_tmp
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         workbook.save(tmp_path)
@@ -961,7 +967,12 @@ def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
             "Opslaan mislukt: het Excel-bestand lijkt in gebruik. Sluit het bestand en probeer opnieuw."
         ) from exc
     except OSError as exc:
-        raise RuntimeError(f"Opslaan mislukt door bestandsfout: {exc}") from exc
+        msg = (
+            f"Opslaan mislukt door bestandsfout: {exc}\n"
+            f"Pad: {path}\n"
+            f"Map bestaat: {os.path.isdir(dir_path)}"
+        )
+        raise RuntimeError(msg) from exc
     finally:
         if os.path.exists(tmp_path):
             try:
@@ -1399,8 +1410,9 @@ class ExcelStore(StorageBackend):
     """
     def __init__(self, year: int, base_dir: str):
         self.year = year
-        self.base_dir = base_dir
-        self.path = os.path.join(base_dir, f"Time_tabel_{year}.xlsx")
+        self.base_dir = os.path.abspath(base_dir)
+        os.makedirs(self.base_dir, exist_ok=True)
+        self.path = os.path.join(self.base_dir, f"Time_tabel_{year}.xlsx")
         self.nl_holidays = holidays.NL(years=[year])
         self.planned_data: dict[str, dict[str, str]] = {}
         self.worked_data: dict[str, str] = {}
@@ -6848,9 +6860,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 

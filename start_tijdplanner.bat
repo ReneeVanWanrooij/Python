@@ -4,35 +4,46 @@ setlocal
 rem Start altijd vanuit de map waar dit .bat-bestand staat.
 set "APP_DIR=%~dp0"
 pushd "%APP_DIR%" >nul 2>&1
+set "SCRIPT=%APP_DIR%pyside6_kalender_app.py"
 
-rem Gebruik bij voorkeur de Python Launcher op Windows.
-where pyw >nul 2>&1
-if %errorlevel%==0 (
-    start "" pyw "%APP_DIR%pyside6_kalender_app.py"
+if not exist "%SCRIPT%" (
+    echo [FOUT] Script niet gevonden:
+    echo        %SCRIPT%
+    pause
     goto :done
 )
 
+set "RUNNER="
 where py >nul 2>&1
-if %errorlevel%==0 (
-    start "" py "%APP_DIR%pyside6_kalender_app.py"
+if %errorlevel%==0 set "RUNNER=py"
+
+if not defined RUNNER (
+    where python >nul 2>&1
+    if %errorlevel%==0 set "RUNNER=python"
+)
+
+if not defined RUNNER (
+    echo [FOUT] Python niet gevonden in PATH.
+    echo        Installeer Python 3 of voeg Python toe aan PATH.
+    pause
     goto :done
 )
 
-rem Fallback: standaard python in PATH.
-where pythonw >nul 2>&1
-if %errorlevel%==0 (
-    start "" pythonw "%APP_DIR%pyside6_kalender_app.py"
+echo [INFO] Start Tijdplanner...
+echo [INFO] Map: %APP_DIR%
+echo [INFO] Runner: %RUNNER%
+echo.
+
+call %RUNNER% "%SCRIPT%"
+set "RC=%ERRORLEVEL%"
+
+if not "%RC%"=="0" (
+    echo.
+    echo [FOUT] Tijdplanner stopte met exitcode %RC%.
+    echo        Controleer de foutmelding hierboven.
+    pause
     goto :done
 )
-
-where python >nul 2>&1
-if %errorlevel%==0 (
-    start "" python "%APP_DIR%pyside6_kalender_app.py"
-    goto :done
-)
-
-echo Python niet gevonden. Installeer Python 3 en probeer opnieuw.
-pause
 
 :done
 popd >nul 2>&1
