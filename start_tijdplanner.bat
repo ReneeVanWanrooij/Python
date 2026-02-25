@@ -1,39 +1,40 @@
 @echo off
 setlocal
 
-set "SCRIPT=C:\Users\Rvwan\Downloads\pyside6_kalender_app.py"
+rem Start altijd vanuit de map waar dit .bat-bestand staat.
+set "APP_DIR=%~dp0"
+pushd "%APP_DIR%" >nul 2>&1
 
-if not exist "%SCRIPT%" (
-  echo [FOUT] Script niet gevonden: %SCRIPT%
-  pause
-  exit /b 1
-)
-
-where pythonw >nul 2>nul
+rem Gebruik bij voorkeur de Python Launcher op Windows.
+where pyw >nul 2>&1
 if %errorlevel%==0 (
-  start "" pythonw "%SCRIPT%"
-  exit /b 0
+    start "" pyw "%APP_DIR%pyside6_kalender_app.py"
+    goto :done
 )
 
-where pyw >nul 2>nul
+where py >nul 2>&1
 if %errorlevel%==0 (
-  start "" pyw "%SCRIPT%"
-  exit /b 0
+    start "" py "%APP_DIR%pyside6_kalender_app.py"
+    goto :done
 )
 
-where python >nul 2>nul
+rem Fallback: standaard python in PATH.
+where pythonw >nul 2>&1
 if %errorlevel%==0 (
-  start "" python "%SCRIPT%"
-  exit /b 0
+    start "" pythonw "%APP_DIR%pyside6_kalender_app.py"
+    goto :done
 )
 
-where py >nul 2>nul
+where python >nul 2>&1
 if %errorlevel%==0 (
-  start "" py "%SCRIPT%"
-  exit /b 0
+    start "" python "%APP_DIR%pyside6_kalender_app.py"
+    goto :done
 )
 
-echo [FOUT] Geen Python gevonden in PATH.
-echo Installeer Python of voeg python.exe toe aan PATH.
+echo Python niet gevonden. Installeer Python 3 en probeer opnieuw.
 pause
-exit /b 1
+
+:done
+popd >nul 2>&1
+endlocal
+exit /b

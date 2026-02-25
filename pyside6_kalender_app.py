@@ -150,6 +150,7 @@ def run_bootstrap(
     check_rows = [("__python__", "", "Python runtime")] + checks
     close_btn = None
     optional_install_failed: list[str] = []
+    trusted_hosts = ("pypi.org", "files.pythonhosted.org")
 
     def _is_optional(import_name: str) -> bool:
         return import_name in OPTIONAL_BOOTSTRAP_IMPORTS
@@ -203,12 +204,98 @@ def run_bootstrap(
         _log("[X] pip nog steeds niet beschikbaar", "#ff9492")
         return False
 
+    def _contains_ssl_problem(lines: list[str]) -> bool:
+        txt = " ".join(lines or []).lower()
+        needles = (
+            "ssl",
+            "certificate verify failed",
+            "could not find a suitable tls ca certificate bundle",
+            "invalid path",
+            "tls ca certificate",
+        )
+        return any(n in txt for n in needles)
+
+    def _run_pip_and_log(args: list[str], log_fn=None) -> tuple[int, list[str]]:
+        recent: list[str] = []
+
+        def _log(msg: str, color: str = "#dce4f0"):
+            if callable(log_fn):
+                try:
+                    log_fn(msg, color)
+                except Exception:
+                    pass
+
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception as exc:
+            recent.append(str(exc))
+            _log(f"[X] Pip starten mislukt: {exc}", "#ff9492")
+            return 1, recent
+
+        while True:
+            line = proc.stdout.readline() if proc.stdout else ""
+            if line == "" and proc.poll() is not None:
+                break
+            if line:
+                clean = line.strip()
+                if clean:
+                    recent.append(clean)
+                    if len(recent) > 25:
+                        recent.pop(0)
+                    _log(clean[:180], "#f3b37a")
+        return int(proc.returncode or 0), recent
+
+    def _pip_upgrade_healthcheck(log_fn=None):
+        def _log(msg: str, color: str = "#dce4f0"):
+            if callable(log_fn):
+                try:
+                    log_fn(msg, color)
+                except Exception:
+                    pass
+
+        _log("[~] Pip health-check (upgrade test)...", "#9ecbff")
+        rc, recent = _run_pip_and_log(["install", "--user", "--upgrade", "pip"], log_fn)
+        if rc == 0:
+            _log("[V] Pip upgrade-check geslaagd", "#7ad18b")
+            return
+        if _contains_ssl_problem(recent):
+            _log("[!] SSL/proxy issue gedetecteerd; retry met trusted-host...", "#f3b37a")
+            th_args: list[str] = []
+            for host in trusted_hosts:
+                th_args.extend(["--trusted-host", host])
+            rc2, _recent2 = _run_pip_and_log(["install", "--user", "--upgrade", "pip", *th_args], log_fn)
+            if rc2 == 0:
+                _log("[V] Pip upgrade-check geslaagd via trusted-host", "#7ad18b")
+                return
+        _log("[!] Pip upgrade-check overgeslagen (niet-blokkerend).", "#f3b37a")
+
+    def _pip_install_with_retry(import_name: str, pip_pkg: str, log_fn=None) -> tuple[int, list[str]]:
+        rc, recent = _run_pip_and_log(["install", pip_pkg, "--user"], log_fn)
+        if rc == 0:
+            return rc, recent
+        if not _contains_ssl_problem(recent):
+            return rc, recent
+        if callable(log_fn):
+            log_fn("[!] SSL/cert probleem gedetecteerd; retry met trusted-host...", "#f3b37a")
+        th_args: list[str] = []
+        for host in trusted_hosts:
+            th_args.extend(["--trusted-host", host])
+        rc2, recent2 = _run_pip_and_log(["install", pip_pkg, "--user", *th_args], log_fn)
+        return rc2, recent2
+
     if tk is None or ttk is None:
         py_ok = bool(sys.executable) and os.path.exists(sys.executable)
         if not py_ok:
             return False
         if not dry_run and not _ensure_pip_available():
             return False
+        if not dry_run:
+            _pip_upgrade_healthcheck()
         for import_name, pip_pkg, _label in checks:
             try:
                 if simulate_missing:
@@ -219,7 +306,7 @@ def run_bootstrap(
                 pass
             if dry_run:
                 continue
-            rc = subprocess.call([sys.executable, "-m", "pip", "install", pip_pkg, "--user"])
+            rc, _recent = _pip_install_with_retry(import_name, pip_pkg)
             if rc != 0:
                 if _is_optional(import_name):
                     continue
@@ -382,6 +469,7 @@ def run_bootstrap(
         if not _ensure_pip_available(log_line):
             log_line("[!] Tip: controleer of Python volledig is geinstalleerd en of ensurepip beschikbaar is.", "#f3b37a")
             return hold_on_error("Fout: pip niet beschikbaar")
+        _pip_upgrade_healthcheck(log_line)
 
     for i, (import_name, pip_pkg, label) in enumerate(checks, start=1):
         set_check_state(import_name, "running")
@@ -412,25 +500,8 @@ def run_bootstrap(
             root.update()
             continue
 
-        process = subprocess.Popen(
-            [sys.executable, "-m", "pip", "install", pip_pkg, "--user"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        pip_recent_lines: list[str] = []
-        while True:
-            line = process.stdout.readline() if process.stdout else ""
-            if line == "" and process.poll() is not None:
-                break
-            if line:
-                clean = line.strip()
-                if clean:
-                    pip_recent_lines.append(clean)
-                    if len(pip_recent_lines) > 18:
-                        pip_recent_lines.pop(0)
-                log_line(clean[:140], "#f3b37a")
-        if process.returncode != 0:
+        rc, pip_recent_lines = _pip_install_with_retry(import_name, pip_pkg, log_line)
+        if rc != 0:
             hint = _bootstrap_failure_hint(import_name, pip_pkg, pip_recent_lines)
             if _is_optional(import_name):
                 set_check_state(import_name, "fail", "optioneel: installatie fout")
@@ -839,6 +910,7 @@ def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
     het doelbestand vervangen. Dat voorkomt dat een halve write het originele
     bestand direct beschadigt.
     """
+    dir_path = os.path.dirname(path) or "."
     tmp_path = f"{path}.tmp"
     bak_path = f"{path}.bak"
     # Rotating snapshots beperken schade bij late detectie van bestandscorruptie.
@@ -850,6 +922,9 @@ def save_workbook_atomic(workbook, path: str, keep_backup: bool = True):
         save_workbook_atomic._last_snapshot_ts = {}
 
     try:
+        # OneDrive/nieuwe werkplekken kunnen een pad doorgeven waarvan de map
+        # nog niet fysiek bestaat; borg dat eerst om FileNotFound te voorkomen.
+        os.makedirs(dir_path, exist_ok=True)
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         workbook.save(tmp_path)
