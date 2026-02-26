@@ -140,6 +140,8 @@ BOOTSTRAP_CHECKS: list[tuple[str, str, str]] = [
     ("win32com.client", "pywin32", "Outlook agenda hint"),
 ]
 OPTIONAL_BOOTSTRAP_IMPORTS = {"pycaw", "win32com.client"}
+CALL_DEBUG_ENABLED = "--call-debug" in sys.argv or os.environ.get("TP_CALL_DEBUG", "").strip() == "1"
+CALL_DEBUG_LOG_ENABLED = "--call-debug-log" in sys.argv or os.environ.get("TP_CALL_DEBUG_LOG", "").strip() == "1"
 
 
 def run_bootstrap(
@@ -4193,6 +4195,13 @@ class TimerPanel(QFrame):
         self._outlook_meeting_now_cache = False
         self._lock_elapsed_seconds = 0
         self._await_unlock_pause_prompt = False
+        self.call_debug_enabled = CALL_DEBUG_ENABLED
+        self.call_debug_log_enabled = CALL_DEBUG_LOG_ENABLED or self.call_debug_enabled
+        self._call_debug_text = "call-debug: init"
+        self._call_debug_last_emit_ts = 0.0
+        self._call_debug_last_text = ""
+        base_dir = getattr(self.store, "base_dir", os.path.dirname(os.path.abspath(__file__)))
+        self._call_debug_log_path = os.path.join(base_dir, "call_detection_debug.log")
         self._idle_episode_active = False
         self._idle_episode_seconds = 0
         self._unconfirmed_pause_seconds = 0
@@ -4238,6 +4247,14 @@ class TimerPanel(QFrame):
         self.idle_label.setAlignment(Qt.AlignCenter)
         self.idle_label.setStyleSheet("font: 9pt 'Consolas'; font-weight:700;")
         root.addWidget(self.idle_label)
+
+        self.call_debug_label = QLabel("")
+        self.call_debug_label.setVisible(bool(self.call_debug_enabled))
+        self.call_debug_label.setWordWrap(True)
+        self.call_debug_label.setStyleSheet("font: 7.8pt 'Consolas'; color:#9fb0c5;")
+        if self.call_debug_enabled:
+            self.call_debug_label.setText("call-debug: waiting for first probe")
+        root.addWidget(self.call_debug_label)
 
         self.pause_confirm_row = QWidget(self)
         pause_row_layout = QHBoxLayout(self.pause_confirm_row)
@@ -4544,23 +4561,22 @@ class TimerPanel(QFrame):
         has_call_audio = any(p in audio_active for p in self.CALL_APP_PROCESSES)
         has_browser_audio = any(p in audio_active for p in self.BROWSER_PROCESSES)
         titles_have_call = False
+        detected = False
 
         # Directe signalen: call-app met actieve audio of foreground-call context.
         if has_call_audio:
-            return True
-
-        if fg_has_call:
+            detected = True
+        elif fg_has_call:
             if fg_proc in self.CALL_APP_PROCESSES and has_call_audio:
-                return True
-            if fg_proc in self.BROWSER_PROCESSES and has_browser_audio:
-                return True
-            if has_call_audio or has_browser_audio:
-                return True
-            if outlook_meeting_now and has_call_app:
-                return True
+                detected = True
+            elif fg_proc in self.BROWSER_PROCESSES and has_browser_audio:
+                detected = True
+            elif has_call_audio or has_browser_audio:
+                detected = True
+            elif outlook_meeting_now and has_call_app:
+                detected = True
 
-        # Titel-scan over alle vensters: nuttig wanneer call niet in foreground staat.
-        if gw is not None:
+        if not detected and gw is not None:
             try:
                 titles = gw.getAllTitles()
             except Exception:
@@ -4569,14 +4585,49 @@ class TimerPanel(QFrame):
                 if self._is_likely_call_title(str(t or "")):
                     titles_have_call = True
                     if has_call_audio:
-                        return True
+                        detected = True
+                        break
                     if has_browser and has_browser_audio:
-                        return True
+                        detected = True
+                        break
                     if has_call_app:
-                        return True
-        if outlook_meeting_now and titles_have_call and has_call_app:
-            return True
-        return False
+                        detected = True
+                        break
+                    # Minder strikt: als call-achtige titel bestaat, telt dit als
+                    # actief call-signaal, ook als procesnaam op corporate build
+                    # afwijkt van onze bekende lijst.
+                    detected = True
+                    break
+        if not detected and outlook_meeting_now and titles_have_call and has_call_app:
+            detected = True
+
+        if self.call_debug_enabled:
+            fg_short = (fg_title or "").strip().replace("\n", " ")
+            if len(fg_short) > 42:
+                fg_short = fg_short[:42] + "..."
+            self._call_debug_text = (
+                f"call={int(detected)} audio_app={int(has_call_audio)} audio_browser={int(has_browser_audio)} "
+                f"proc_call={int(has_call_app)} proc_browser={int(has_browser)} title={int(fg_has_call)} "
+                f"titles={int(titles_have_call)} outlook_now={int(outlook_meeting_now)} fg_proc={fg_proc or '-'} "
+                f"fg='{fg_short or '-'}'"
+            )
+        return detected
+
+    def _append_call_debug_log(self):
+        if not self.call_debug_log_enabled:
+            return
+        now = time.monotonic()
+        txt = self._call_debug_text or ""
+        if txt == self._call_debug_last_text and (now - self._call_debug_last_emit_ts) < 5.0:
+            return
+        self._call_debug_last_emit_ts = now
+        self._call_debug_last_text = txt
+        try:
+            os.makedirs(os.path.dirname(self._call_debug_log_path) or ".", exist_ok=True)
+            with open(self._call_debug_log_path, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {txt}\n")
+        except Exception:
+            pass
 
     def detect_call(self) -> bool:
         now = time.monotonic()
@@ -4827,6 +4878,9 @@ class TimerPanel(QFrame):
         self.lbl_line.setText(
             f"T: {seconds_to_hhmmss(self.work_seconds)}  P: {seconds_to_hhmmss(self.idle_seconds)}  C: {seconds_to_hhmmss(self.call_seconds)}{suffix}"
         )
+        if self.call_debug_enabled and self.call_debug_label is not None:
+            self.call_debug_label.setText(self._call_debug_text)
+        self._append_call_debug_log()
 
 
 # ============================================================================
@@ -7002,9 +7056,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
 
 

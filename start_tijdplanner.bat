@@ -47,9 +47,10 @@ if not defined RUNNER (
 echo [INFO] Start Tijdplanner...
 echo [INFO] Map: %APP_DIR%
 echo [INFO] Runner: %RUNNER%
+echo [INFO] Args: %*
 echo.
 
-call %RUNNER% "%SCRIPT%"
+call %RUNNER% "%SCRIPT%" %*
 set "RC=%ERRORLEVEL%"
 
 if not "%RC%"=="0" (
