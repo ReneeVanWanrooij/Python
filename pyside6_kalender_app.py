@@ -46,6 +46,10 @@ try:
 except Exception:
     AudioUtilities = None
 try:
+    import win32com.client as win32_client
+except Exception:
+    win32_client = None
+try:
     from openpyxl import Workbook, load_workbook
     from openpyxl.styles import PatternFill
 except Exception:
@@ -133,8 +137,9 @@ BOOTSTRAP_CHECKS: list[tuple[str, str, str]] = [
     ("psutil", "psutil", "Procesdetectie"),
     ("pygetwindow", "pygetwindow", "Window detectie"),
     ("pycaw", "pycaw", "Audio sessie detectie"),
+    ("win32com.client", "pywin32", "Outlook agenda hint"),
 ]
-OPTIONAL_BOOTSTRAP_IMPORTS = {"pycaw"}
+OPTIONAL_BOOTSTRAP_IMPORTS = {"pycaw", "win32com.client"}
 
 
 def run_bootstrap(
@@ -4082,7 +4087,9 @@ class TimerPanel(QFrame):
     DEFAULT_IDLE_THRESHOLD_SEC = 60
     PAUSE_CONFIRM_TIMEOUT_SEC = 45
     CALL_PROBE_INTERVAL_SEC = 2.0
-    CALL_HOLD_SECONDS = 8.0
+    CALL_HOLD_SECONDS = 10.0
+    CALL_WARMUP_SECONDS = 5.0
+    OUTLOOK_PROBE_INTERVAL_SEC = 60.0
 
     CALL_APP_PROCESSES = {
         "teams",
@@ -4101,7 +4108,6 @@ class TimerPanel(QFrame):
     }
     CALL_TITLE_KEYWORDS = (
         "teams meeting",
-        "microsoft teams",
         "zoom meeting",
         "google meet",
         "meet.google.com",
@@ -4110,7 +4116,13 @@ class TimerPanel(QFrame):
         "in gesprek",
         "in call",
         "on a call",
-        "meeting",
+    )
+    OUTLOOK_CALL_KEYWORDS = (
+        "teams",
+        "zoom",
+        "google meet",
+        "meet.google.com",
+        "webex",
     )
 
     class LASTINPUTINFO(ctypes.Structure):
@@ -4171,6 +4183,11 @@ class TimerPanel(QFrame):
         self._call_detect_cache = False
         self._call_hold_until = 0.0
         self._call_last_probe = 0.0
+        self._call_warmup_start = 0.0
+        self._outlook_last_probe = 0.0
+        self._outlook_meeting_now_cache = False
+        self._lock_elapsed_seconds = 0
+        self._await_unlock_pause_prompt = False
         self._idle_episode_active = False
         self._idle_episode_seconds = 0
         self._unconfirmed_pause_seconds = 0
@@ -4399,7 +4416,59 @@ class TimerPanel(QFrame):
         t = (title or "").strip().casefold()
         if not t:
             return False
+        if t in {"microsoft teams", "teams", "zoom workplace", "zoom"}:
+            return False
         return any(k in t for k in cls.CALL_TITLE_KEYWORDS)
+
+    @classmethod
+    def _has_outlook_call_hint(cls, subject: str, location: str, body: str = "") -> bool:
+        txt = f"{subject or ''} {location or ''} {body or ''}".casefold()
+        if not txt.strip():
+            return False
+        return any(k in txt for k in cls.OUTLOOK_CALL_KEYWORDS)
+
+    def _is_outlook_meeting_now(self) -> bool:
+        if sys.platform != "win32" or win32_client is None:
+            return False
+        now_m = time.monotonic()
+        if now_m - self._outlook_last_probe < self.OUTLOOK_PROBE_INTERVAL_SEC:
+            return self._outlook_meeting_now_cache
+        self._outlook_last_probe = now_m
+        self._outlook_meeting_now_cache = False
+
+        try:
+            outlook = win32_client.Dispatch("Outlook.Application")
+            ns = outlook.GetNamespace("MAPI")
+            cal = ns.GetDefaultFolder(9)  # olFolderCalendar
+            items = cal.Items
+            items.IncludeRecurrences = True
+            items.Sort("[Start]")
+            now_dt = datetime.now()
+            max_end = now_dt + timedelta(hours=6)
+            count = 0
+            for appt in items:
+                count += 1
+                if count > 300:
+                    break
+                try:
+                    st = getattr(appt, "Start", None)
+                    en = getattr(appt, "End", None)
+                    if not st or not en:
+                        continue
+                    if st > max_end:
+                        break
+                    if st <= now_dt <= en:
+                        subject = str(getattr(appt, "Subject", "") or "")
+                        location = str(getattr(appt, "Location", "") or "")
+                        body = str(getattr(appt, "Body", "") or "")
+                        if bool(getattr(appt, "IsOnlineMeeting", False)) or self._has_outlook_call_hint(subject, location, body):
+                            self._outlook_meeting_now_cache = True
+                            return True
+                except Exception:
+                    continue
+        except Exception:
+            self._outlook_meeting_now_cache = False
+        return self._outlook_meeting_now_cache
 
     def _running_process_names(self) -> set[str]:
         if psutil is None:
@@ -4464,6 +4533,7 @@ class TimerPanel(QFrame):
         audio_active = self._active_audio_session_processes()
         fg_title, fg_proc = self._foreground_context()
         fg_has_call = self._is_likely_call_title(fg_title)
+        outlook_meeting_now = self._is_outlook_meeting_now()
         has_call_app = any(p in running for p in self.CALL_APP_PROCESSES)
         has_browser = any(p in running for p in self.BROWSER_PROCESSES)
         has_call_audio = any(p in audio_active for p in self.CALL_APP_PROCESSES)
@@ -4474,22 +4544,24 @@ class TimerPanel(QFrame):
             return True
 
         if fg_has_call:
-            if fg_proc in self.CALL_APP_PROCESSES:
+            if fg_proc in self.CALL_APP_PROCESSES and has_call_audio:
                 return True
             if fg_proc in self.BROWSER_PROCESSES and has_browser_audio:
                 return True
-            if has_call_app or has_call_audio or has_browser_audio:
+            if has_call_audio or has_browser_audio:
+                return True
+            if outlook_meeting_now and has_call_app:
                 return True
 
-        # Fallback: scan windowtitels alleen als er relevante processen/audio actief zijn.
-        if gw is not None and (has_call_app or has_browser or has_call_audio or has_browser_audio):
+        # Fallback: scan windowtitels alleen als er relevante audio actief is.
+        if gw is not None and (has_call_audio or has_browser_audio):
             try:
                 titles = gw.getAllTitles()
             except Exception:
                 titles = []
             for t in titles:
                 if self._is_likely_call_title(str(t or "")):
-                    if has_call_app or has_call_audio:
+                    if has_call_audio:
                         return True
                     if has_browser and has_browser_audio:
                         return True
@@ -4505,9 +4577,17 @@ class TimerPanel(QFrame):
 
         detected = self._probe_call_now()
         if detected:
-            self._call_detect_cache = True
             self._call_hold_until = now + self.CALL_HOLD_SECONDS
-            return True
+            if not self._call_detect_cache:
+                if self._call_warmup_start <= 0.0:
+                    self._call_warmup_start = now
+                if now - self._call_warmup_start >= self.CALL_WARMUP_SECONDS:
+                    self._call_detect_cache = True
+                    return True
+            else:
+                self._call_warmup_start = 0.0
+        else:
+            self._call_warmup_start = 0.0
         if now >= self._call_hold_until:
             self._call_detect_cache = False
         return self._call_detect_cache
@@ -4601,10 +4681,24 @@ class TimerPanel(QFrame):
         self._sync_panel_height()
 
     def set_os_context(self, locked: bool | None = None, sleeping: bool | None = None):
+        was_locked = bool(self.os_session_locked)
         if locked is not None:
             self.os_session_locked = bool(locked)
         if sleeping is not None:
             self.os_system_sleeping = bool(sleeping)
+
+        # Bij lock willen we lockduur apart bijhouden; bij unlock tonen we
+        # eventuele pauze-confirmatie pas nadat de sessie weer echt actief is.
+        if not was_locked and self.os_session_locked:
+            self._lock_elapsed_seconds = 0
+        elif was_locked and not self.os_session_locked:
+            self._lock_elapsed_seconds = 0
+            if self.include_lockscreen_idle and self._await_unlock_pause_prompt and self._idle_episode_seconds > 0:
+                self._idle_episode_active = False
+                self._queue_pause_confirmation(self._idle_episode_seconds)
+                self._idle_episode_seconds = 0
+            self._await_unlock_pause_prompt = False
+
         suppress = (self.os_session_locked and not self.include_lockscreen_idle) or (
             self.os_system_sleeping and not self.include_sleep_idle
         )
@@ -4647,6 +4741,22 @@ class TimerPanel(QFrame):
             self._hide_idle_warning()
             self._idle_episode_active = False
             self._idle_episode_seconds = 0
+            self.save_tick += 1
+            if self.save_tick >= self.save_interval:
+                self.persist()
+                self.save_tick = 0
+            self.update_ui()
+            return
+
+        # Tijdens lockscreen negeren we lockscreen-input (zoals muisbeweging op
+        # inlogscherm). We tellen lockduur zelf en tonen de pauze-popup pas na unlock.
+        if self.os_session_locked and self.include_lockscreen_idle:
+            self._hide_idle_warning()
+            self._lock_elapsed_seconds += 1
+            if self._lock_elapsed_seconds >= self.idle_threshold_sec:
+                self._idle_episode_active = True
+                self._idle_episode_seconds += 1
+                self._await_unlock_pause_prompt = True
             self.save_tick += 1
             if self.save_tick >= self.save_interval:
                 self.persist()
@@ -6871,11 +6981,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
 
 
