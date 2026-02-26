@@ -5,10 +5,25 @@ rem Start altijd vanuit de map waar dit .bat-bestand staat.
 set "APP_DIR=%~dp0"
 pushd "%APP_DIR%" >nul 2>&1
 set "SCRIPT=%APP_DIR%pyside6_kalender_app.py"
+set "CFG_FILE=%APP_DIR%tijdplanner_path.txt"
+
+rem Optioneel: extern scriptpad via tekstbestand (1e regel).
+if exist "%CFG_FILE%" (
+    for /f "usebackq tokens=* delims=" %%A in ("%CFG_FILE%") do (
+        if not "%%~A"=="" (
+            set "SCRIPT=%%~A"
+            goto :cfg_done
+        )
+    )
+)
+:cfg_done
 
 if not exist "%SCRIPT%" (
     echo [FOUT] Script niet gevonden:
     echo        %SCRIPT%
+    echo.
+    echo [TIP] Zet het volledige pad naar pyside6_kalender_app.py in:
+    echo       %CFG_FILE%
     pause
     goto :done
 )

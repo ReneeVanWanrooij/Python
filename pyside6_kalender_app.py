@@ -4095,6 +4095,7 @@ class TimerPanel(QFrame):
         "teams",
         "ms-teams",
         "msteams",
+        "teams2",
         "zoom",
         "slack",
         "webex",
@@ -4108,11 +4109,15 @@ class TimerPanel(QFrame):
     }
     CALL_TITLE_KEYWORDS = (
         "teams meeting",
+        "meeting in microsoft teams",
+        "microsoft teams meeting",
         "zoom meeting",
         "google meet",
         "meet.google.com",
         "webex",
         "vergadering",
+        "vergadering met",
+        "gesprek met",
         "in gesprek",
         "in call",
         "on a call",
@@ -4538,6 +4543,7 @@ class TimerPanel(QFrame):
         has_browser = any(p in running for p in self.BROWSER_PROCESSES)
         has_call_audio = any(p in audio_active for p in self.CALL_APP_PROCESSES)
         has_browser_audio = any(p in audio_active for p in self.BROWSER_PROCESSES)
+        titles_have_call = False
 
         # Directe signalen: call-app met actieve audio of foreground-call context.
         if has_call_audio:
@@ -4553,18 +4559,23 @@ class TimerPanel(QFrame):
             if outlook_meeting_now and has_call_app:
                 return True
 
-        # Fallback: scan windowtitels alleen als er relevante audio actief is.
-        if gw is not None and (has_call_audio or has_browser_audio):
+        # Titel-scan over alle vensters: nuttig wanneer call niet in foreground staat.
+        if gw is not None:
             try:
                 titles = gw.getAllTitles()
             except Exception:
                 titles = []
             for t in titles:
                 if self._is_likely_call_title(str(t or "")):
+                    titles_have_call = True
                     if has_call_audio:
                         return True
                     if has_browser and has_browser_audio:
                         return True
+                    if has_call_app:
+                        return True
+        if outlook_meeting_now and titles_have_call and has_call_app:
+            return True
         return False
 
     def detect_call(self) -> bool:
@@ -4764,6 +4775,19 @@ class TimerPanel(QFrame):
             self.update_ui()
             return
 
+        call_active = self.detect_call()
+        if call_active:
+            self._hide_idle_warning()
+            self._idle_episode_active = False
+            self._idle_episode_seconds = 0
+            self.call_seconds += 1
+            self.save_tick += 1
+            if self.save_tick >= self.save_interval:
+                self.persist()
+                self.save_tick = 0
+            self.update_ui()
+            return
+
         idle_sec = self.get_idle_time()
         warning_sec = max(5, min(30, self.idle_threshold_sec // 6))
         if self.idle_threshold_sec - warning_sec <= idle_sec < self.idle_threshold_sec:
@@ -4780,9 +4804,6 @@ class TimerPanel(QFrame):
             if self._idle_episode_seconds > 0:
                 self._queue_pause_confirmation(self._idle_episode_seconds)
             self._idle_episode_seconds = 0
-
-        if self.detect_call():
-            self.call_seconds += 1
 
         self.save_tick += 1
         if self.save_tick >= self.save_interval:
@@ -6981,9 +7002,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 
