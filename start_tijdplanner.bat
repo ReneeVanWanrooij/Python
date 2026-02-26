@@ -18,6 +18,12 @@ if exist "%CFG_FILE%" (
 )
 :cfg_done
 
+set "MODE=DETACH"
+if /I "%~1"=="--console" (
+    set "MODE=CONSOLE"
+    shift
+)
+
 if not exist "%SCRIPT%" (
     echo [FOUT] Script niet gevonden:
     echo        %SCRIPT%
@@ -47,8 +53,25 @@ if not defined RUNNER (
 echo [INFO] Start Tijdplanner...
 echo [INFO] Map: %APP_DIR%
 echo [INFO] Runner: %RUNNER%
+echo [INFO] Mode: %MODE%
 echo [INFO] Args: %*
 echo.
+
+if /I "%MODE%"=="DETACH" (
+    where pyw >nul 2>&1
+    if %errorlevel%==0 (
+        start "" pyw "%SCRIPT%" %*
+        goto :done
+    )
+    where pythonw >nul 2>&1
+    if %errorlevel%==0 (
+        start "" pythonw "%SCRIPT%" %*
+        goto :done
+    )
+    rem Fallback: start via console runner in aparte sessie, BAT sluit direct.
+    start "" %RUNNER% "%SCRIPT%" %*
+    goto :done
+)
 
 call %RUNNER% "%SCRIPT%" %*
 set "RC=%ERRORLEVEL%"

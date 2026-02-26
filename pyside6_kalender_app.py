@@ -568,22 +568,24 @@ def _bootstrap_and_restart_if_needed():
         if not ok:
             raise SystemExit(1)
         raise SystemExit(0)
-    missing = []
+    missing_required: list[tuple[str, str, str]] = []
     for import_name, _pip_pkg, _label in checks:
         try:
             importlib.import_module(import_name)
         except Exception:
             if import_name in OPTIONAL_BOOTSTRAP_IMPORTS:
                 continue
-            missing.append(import_name)
-    if not missing:
+            missing_required.append((import_name, _pip_pkg, _label))
+    if not missing_required:
         return
     if os.environ.get("TP_BOOTSTRAP_DONE") == "1":
-        print("Ontbrekende modules na bootstrap:", ", ".join(missing))
+        print("Ontbrekende modules na bootstrap:", ", ".join(m[0] for m in missing_required))
         raise SystemExit(1)
-    ok = run_bootstrap(checks, dry_run=False)
+    # Start bootstrap alleen voor écht ontbrekende vereiste modules.
+    # Dit maakt startup sneller in omgevingen waar vrijwel alles al aanwezig is.
+    ok = run_bootstrap(missing_required, dry_run=False)
     if not ok:
-        print("Bootstrap mislukt. Installeer handmatig:", ", ".join(missing))
+        print("Bootstrap mislukt. Installeer handmatig:", ", ".join(m[0] for m in missing_required))
         raise SystemExit(1)
     # Na succesvolle install herstarten we het proces expres hard met hetzelfde script + args.
     # Zo laden we direct de nieuw geïnstalleerde modules in een schone interpreter-state.
@@ -2727,6 +2729,18 @@ class MonthCard(QGroupBox):
             return d.v
         return d.worked or "00:00"
 
+    @staticmethod
+    def _seconds_to_hhmm_short(seconds: int) -> str:
+        return minutes_to_hhmm(int(max(0, int(seconds))) // 60)
+
+    def _worked_wpc_text(self, dt: date, day_data: DayData | None = None) -> str:
+        d = day_data or self.store.get_day(dt)
+        row = self.store.get_timer_log(dt)
+        w_txt = normalize_hhmm(d.worked or "00:00", "00:00")
+        p_txt = self._seconds_to_hhmm_short(int(row.get("idle", 0)))
+        c_txt = self._seconds_to_hhmm_short(int(row.get("call", 0)))
+        return f"W {w_txt}\nP {p_txt}\nC {c_txt}"
+
     def _day_number_color(self, dt: date, day_data: DayData | None = None) -> QColor:
         key = dt.strftime("%Y-%m-%d")
         if dt == date.today():
@@ -2767,8 +2781,8 @@ class MonthCard(QGroupBox):
                 self.table.clearSpans()
                 self.table.setRowCount(target_rows)
             self.cell_map.clear()
-            day_h = 36 if self.focus_mode else 18
-            hour_h = 64 if self.focus_mode else 24
+            day_h = 38 if self.focus_mode else 18
+            hour_h = 100 if self.focus_mode else 24
             for week_i, (week_no, week_days) in enumerate(weeks):
                 day_row = week_i * 2
                 hour_row = day_row + 1
@@ -2814,13 +2828,19 @@ class MonthCard(QGroupBox):
                         day_item.setText(str(dt.day))
                         day_item.setBackground(bg)
                         day_item.setForeground(self._day_number_color(dt, day_data))
-                        hours_item.setText(self._hours_text(dt, day_data))
+                        if self.mode == "worked" and self.focus_mode:
+                            hours_item.setText(self._worked_wpc_text(dt, day_data))
+                        else:
+                            hours_item.setText(self._hours_text(dt, day_data))
                         if self.mode == "planned":
                             hours_item.setBackground(self._planned_hours_brush(dt, bg, day_data, info))
                         else:
                             base_bg = self._worked_hours_base_bg(dt)
                             hours_item.setBackground(self._worked_hours_brush(dt, base_bg, day_data))
                         hours_item.setForeground(QColor(self.colors["hours_fg_dark"]))
+                        if self.mode == "worked" and self.focus_mode:
+                            hours_item.setTextAlignment(Qt.AlignCenter)
+                            hours_item.setFont(QFont("Consolas", 12, QFont.Bold))
                         day_item.setData(Qt.UserRole, True)
                         hours_item.setData(Qt.UserRole, True)
                         reason = self.store.day_reason(dt)
@@ -2851,17 +2871,38 @@ class MonthCard(QGroupBox):
 
                 if iso_year is not None and iso_week is not None:
                     week_total = 0
+                    planned_work_week = 0
+                    planned_free_week = 0
+                    idle_week_s = 0
+                    call_week_s = 0
                     for d in range(1, 8):
                         try:
                             wdt = date.fromisocalendar(iso_year, iso_week, d)
                         except ValueError:
                             continue
                         day = self.store.get_day(wdt)
+                        planned_work_week += hhmm_to_minutes(day.w)
+                        planned_free_week += hhmm_to_minutes(day.v) + hhmm_to_minutes(day.z)
+                        row = self.store.get_timer_log(wdt)
+                        idle_week_s += int(row.get("idle", 0))
+                        call_week_s += int(row.get("call", 0))
                         if self.mode == "planned":
                             week_total += hhmm_to_minutes(day.w) + hhmm_to_minutes(day.v) + hhmm_to_minutes(day.z)
                         else:
                             week_total += hhmm_to_minutes(day.worked)
-                    tot_txt = minutes_to_hhmm(week_total)
+                    if self.mode == "worked" and self.focus_mode:
+                        if week_total == 0 and planned_work_week == 0 and planned_free_week > 0:
+                            tot_txt = "Vrij\nW 00:00\nP 00:00\nC 00:00"
+                        else:
+                            tot_txt = (
+                                f"W {minutes_to_hhmm(week_total)}\n"
+                                f"P {self._seconds_to_hhmm_short(idle_week_s)}\n"
+                                f"C {self._seconds_to_hhmm_short(call_week_s)}"
+                            )
+                    elif self.mode == "worked" and week_total == 0 and planned_work_week == 0 and planned_free_week > 0:
+                        tot_txt = "vrij"
+                    else:
+                        tot_txt = minutes_to_hhmm(week_total)
                 else:
                     tot_txt = minutes_to_hhmm(total_min)
                 tot = self.table.item(day_row, 8)
@@ -2873,6 +2914,9 @@ class MonthCard(QGroupBox):
                 tot.setBackground(QColor(self.colors["weektotal_bg_dark"]))
                 tot.setForeground(QColor(self.colors["weektotal_fg_dark"]))
                 tot.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                if self.mode == "worked" and self.focus_mode:
+                    tot.setTextAlignment(Qt.AlignCenter)
+                    tot.setFont(QFont("Consolas", 12, QFont.Bold))
                 tot.setData(Qt.UserRole, True)
                 if structure_changed:
                     self.table.setSpan(day_row, 8, 2, 1)
@@ -2884,7 +2928,7 @@ class MonthCard(QGroupBox):
                     for c in range(1, 8):
                         self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
                     self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
-                    self.table.setColumnWidth(8, 132)
+                    self.table.setColumnWidth(8, 148)
                 else:
                     self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
                     self.table.setColumnWidth(0, 56)
@@ -5960,21 +6004,29 @@ class MainWindow(QMainWindow):
     def refresh_dashboard(self):
         if not hasattr(self, "tile_mix"):
             return
-        # Dashboard haalt brondata uit data_log (werk/idle/call) en combineert die met planning/budgetdata.
-        # Hierdoor krijg je in één scherm zowel operationele tijdsbesteding als planningscontext.
+        # Dashboard aggregeert per kalenderdag. Gewerkte uren komen primair uit
+        # day.worked (inclusief handmatige correcties), terwijl idle/call uit
+        # data_log komen. Zo blijven handmatige uren zichtbaar in alle KPI's.
         start, end = self._dashboard_date_range()
         include_weekend = bool(self.dash_include_weekend.isChecked())
 
         rows: list[tuple[date, int, int, int]] = []
-        for k, v in self.store.data_log.items():
-            dt = normalize_to_date(k)
-            if not dt:
-                continue
+        for dt in daterange(start, end):
             if dt < start or dt > end:
                 continue
             if (not include_weekend) and dt.weekday() >= 5:
                 continue
-            rows.append((dt, int(v.get("work", 0)), int(v.get("idle", 0)), int(v.get("call", 0))))
+            day = self.store.get_day(dt)
+            log = self.store.get_timer_log(dt)
+            planned_total_m = hhmm_to_minutes(day.w) + hhmm_to_minutes(day.v) + hhmm_to_minutes(day.z)
+            worked_s = hhmm_to_minutes(day.worked) * 60
+            idle_s = int(log.get("idle", 0))
+            call_s = int(log.get("call", 0))
+            # Neem alle relevante dagen mee binnen de actieve dashboardfilter:
+            # gepland (werk/vrij), gewerkt, pauze of call.
+            if worked_s <= 0 and idle_s <= 0 and call_s <= 0 and planned_total_m <= 0:
+                continue
+            rows.append((dt, int(worked_s), idle_s, call_s))
         rows.sort(key=lambda x: x[0])
 
         rows_with_plan: list[tuple[date, int, int, int, int, int]] = []
@@ -6053,8 +6105,9 @@ class MainWindow(QMainWindow):
         )
 
         self.dash_table.setRowCount(0)
-        # Detailset toont de grootste plan-werk afwijkingen voor snelle bijsturing.
-        for dt, planned_m, worked_m, delta_m, i_s, c_s in sorted(rows_with_plan, key=lambda x: abs(x[3]), reverse=True)[:10]:
+        # Detailset toont alle dagen in de selectie zodat niets wegvalt.
+        # Sorteer op datum (nieuwste bovenaan) voor snelle dagelijkse controle.
+        for dt, planned_m, worked_m, delta_m, i_s, c_s in sorted(rows_with_plan, key=lambda x: x[0], reverse=True):
             r = self.dash_table.rowCount()
             self.dash_table.insertRow(r)
             self.dash_table.setItem(r, 0, QTableWidgetItem(dt.strftime("%d-%m-%Y")))
@@ -7056,5 +7109,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
